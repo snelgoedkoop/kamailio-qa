@@ -1,7 +1,7 @@
 diff --git a/modules/db_kazoo/Makefile b/modules/db_kazoo/Makefile
 new file mode 100644
 index 0000000..68a92c3
---- a/modules/db_kazoo/Makefile
+--- /dev/null
 +++ b/modules/db_kazoo/Makefile
 @@ -0,0 +1,17 @@
 +# $Id$
@@ -24,7 +24,7 @@ index 0000000..68a92c3
 diff --git a/modules/db_kazoo/db_kazoo.c b/modules/db_kazoo/db_kazoo.c
 new file mode 100644
 index 0000000..236d6fc
---- a/modules/db_kazoo/Makefile
+--- /dev/null
 +++ b/modules/db_kazoo/db_kazoo.c
 @@ -0,0 +1,161 @@
 +/*
@@ -191,7 +191,7 @@ index 0000000..236d6fc
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
 index 0000000..3679108
---- a/modules/db_kazoo/Makefile
+--- /dev/null
 +++ b/modules/db_kazoo/dbase.c
 @@ -0,0 +1,815 @@
 +
@@ -1012,7 +1012,7 @@ index 0000000..3679108
 diff --git a/modules/db_kazoo/dbase.h b/modules/db_kazoo/dbase.h
 new file mode 100644
 index 0000000..1d03668
---- a/modules/db_kazoo/Makefile
+--- /dev/null
 +++ b/modules/db_kazoo/dbase.h
 @@ -0,0 +1,19 @@
 +#ifndef _DB_KAZOO_DBASE_
