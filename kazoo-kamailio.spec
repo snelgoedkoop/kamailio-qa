@@ -11,7 +11,7 @@ Release:       %rel
 Packager:      Peter Dunkley <peter@dunkley.me.uk>
 License:       GPL
 Group:         System Environment/Daemons
-Source:        kazoo-kamailio.tar
+Source:        Kazoo-Kamailio.tar
 URL:           http://kamailio.org/
 Vendor:        kamailio.org
 BuildRoot:     %{_tmppath}/%{name}-%{ver}-buildroot
