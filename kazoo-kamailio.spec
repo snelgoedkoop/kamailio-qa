@@ -108,13 +108,13 @@ json string operation and rpc support for Kamailio.
 
 
 %prep
-%setup -n %{name}-%{ver}
+%setup -n Kazoo-Kamailio
 
 
 
 %build
 make FLAVOUR=kamailio cfg prefix=/usr cfg_prefix=$RPM_BUILD_ROOT\
-  basedir=$RPM_BUILD_ROOT cfg_target=/%{_sysconfdir}/kamailio/\
+  basedir=$RPM_BUILD_ROOT cfg_target=/%{_sysconfdir}/kazoo/kamailio/\
   modules_dirs="modules" SCTP=1 STUN=1
 make
 %if 0%{?fedora}
