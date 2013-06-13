@@ -100,8 +100,8 @@ Functions for secure identification of originators of SIP messages for Kamailio.
 %package json
 Summary:       json string operation and rpc support for Kamailio.
 Group:         System Environment/Daemons
-Requires:      json-c, libevent, kamailio = %ver
-BuildRequires: json-c-devel, libevent-devel
+#Requires:      json-c, libevent, kamailio = %ver
+#BuildRequires: json-c-devel, libevent-devel
 
 %description json
 json string operation and rpc support for Kamailio.
