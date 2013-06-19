@@ -23,10 +23,10 @@ index 0000000..68a92c3
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/db_kazoo.c b/modules/db_kazoo/db_kazoo.c
 new file mode 100644
-index 0000000..236d6fc
+index 0000000..af17795
 --- /dev/null
 +++ b/modules/db_kazoo/db_kazoo.c
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,182 @@
 +/*
 + * $Id$
 + *
@@ -61,12 +61,16 @@ index 0000000..236d6fc
 +#include "../../sr_module.h"
 +#include "../../lib/srdb1/db.h"
 +#include "../../dprint.h"
++#include "../tm/tm_load.h"
 +
 +#include "dbase.h"
 +
 +static int mod_init(void);
 +static void mod_destroy(void);
 +int db_kazoo_bind_api(db_func_t *dbb);
++str dbk_node_hostname={0, 0};
++str dbk_reg_fs_path={0, 0};
++struct tm_binds tmb;
 +
 +MODULE_VERSION
 +
@@ -80,6 +84,8 @@ index 0000000..236d6fc
 +
 +
 +static param_export_t params[] = {
++	{"node_hostname",    STR_PARAM, &dbk_node_hostname.s},
++	{"register_fs_path", STR_PARAM, &dbk_reg_fs_path.s  },
 +	{0, 0, 0}
 +};
 +
@@ -100,6 +106,21 @@ index 0000000..236d6fc
 +
 +static int mod_init(void)
 +{
++	if (dbk_node_hostname.s == NULL) {
++		LM_ERR("You must set the node_hostname parameter\n");
++		return -1;
++	}
++	dbk_node_hostname.len = strlen(dbk_node_hostname.s);
++	
++	if (dbk_reg_fs_path.s) dbk_reg_fs_path.len = strlen(dbk_reg_fs_path.s);
++
++	/* load all TM stuff */
++	if(load_tm_api(&tmb)==-1)
++	{
++		LM_ERR("Can't load tm functions. Module TM not loaded?\n");
++		return -1;
++	}
++	
 +	return 0;
 +}
 +
@@ -190,10 +211,10 @@ index 0000000..236d6fc
 +}
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..3679108
+index 0000000..c0a9b0a
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
-@@ -0,0 +1,815 @@
+@@ -0,0 +1,841 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -208,6 +229,8 @@ index 0000000..3679108
 +#include "../../lib/srdb1/db_pool.h"
 +#include "../../dprint.h"
 +#include "../../mem/mem.h"
++
++#include "dbase.h"
 +
 +typedef struct rmq_conn {
 +	struct db_id* id;        /**< Connection identifier */
@@ -474,6 +497,7 @@ index 0000000..3679108
 +	LM_INFO("Password: [%s]\n", password.s);
 +
 +	RES_COL_N(db_res) = _nc;
++	RES_ROW_N(db_res) = 1;
 +	if (db_allocate_rows(db_res) < 0) {
 +		LM_ERR("Could not allocate rows.\n");
 +		goto error; 
@@ -533,7 +557,6 @@ index 0000000..3679108
 +			RES_ROWS(db_res)[0].values[col].nul  = 1;
 +		} 
 +	}
-+	RES_ROW_N(db_res) = 1;
 +
 +	/* decrement the reference of the object*/
 +	json_object_put(init_json_obj);
@@ -552,13 +575,14 @@ index 0000000..3679108
 +		const db_val_t* _v, const db_key_t* _c, int _n, int _nc, db1_res_t** _r)
 +{
 +	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
-+	char routingkey[128];
-+	char messagebody[1024];
++	static char routingkey[256];
++	static char messagebody[2024];
++	static char serverid[256];
 +	amqp_bytes_t amqp_rk;
 +	amqp_bytes_t amqp_mb;
-+	char serverid[128];
 +	amqp_bytes_t rpl_queue= {0, 0};
-+	
++	str unique_string = {0, 0};
++
 +	LM_INFO("RMQ struct %p\n", rconn);
 +
 +	/* routingkey = authn.req._auth_realm_ */
@@ -570,20 +594,21 @@ index 0000000..3679108
 +		return -1;
 +	}
 +
++	tmb.generate_callid(&unique_string);
 +	/* construct messagebody */
 +
 +//	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
 +	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
 +
-+	amqp_mb.len = sprintf(messagebody, "{\"Orig-IP\":\"109.103.86.242\","
++	amqp_mb.len = sprintf(messagebody, "{\"Orig-IP\":\"10.10.10.10\","
 +						"\"Method\":\"REGISTER\","
 +						"\"Auth-Realm\":\"%.*s\","
 +						"\"Auth-User\":\"%.*s\","
 +						"\"From\":\"%.*s@%.*s\","
 +						"\"To\":\"%.*s@%.*s\","
 +						"\"Server-ID\":\"%s\","
-+						"\"Node\":\"kamailio@kazoo2.anca-kazoo.com\","
-+						"\"Msg-ID\":\"%s\","
++						"\"Node\":\"kamailio@%.*s\","
++						"\"Msg-ID\":\"%.*s\","
 +						"\"App-Version\":\"%s\","
 +						"\"App-Name\":\"%s\","
 +						"\"Event-Name\":\"authn_req\","
@@ -594,7 +619,9 @@ index 0000000..3679108
 +						_v[1].val.str_val.len, _v[1].val.str_val.s,
 +						_v[0].val.str_val.len, _v[0].val.str_val.s,
 +						_v[1].val.str_val.len, _v[1].val.str_val.s,
-+						serverid,serverid,
++						serverid,
++						dbk_node_hostname.len, dbk_node_hostname.s,
++						unique_string.len, unique_string.s,
 +						VERSION, NAME);
 +	amqp_mb.bytes = messagebody;
 +
@@ -823,11 +850,14 @@ index 0000000..3679108
 +                            	const db_val_t* _v, const int _n) {
 +
 +	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
-+	char routingkey[128];
-+	char messagebody[1024];
++	static char routingkey[256];
++	static char messagebody[2024];
++	static char fspath_buf[64];
 +	amqp_bytes_t amqp_rk;
 +	amqp_bytes_t amqp_mb;
 +	int col;
++	str unique_string;
++	str fs_path;
 +
 +	/* construct messagebody */
 +
@@ -884,10 +914,21 @@ index 0000000..3679108
 +		}
 +	}
 +
++	LM_INFO("user = [%.*s]\n", user.len, user.s);
++	LM_INFO("host = [%.*s]\n", host.len, host.s);
++	LM_INFO("contact = [%.*s]\n", contact.len, contact.s);
 +	LM_INFO("received = [%.*s]\n", received.len, received.s);
 +
-+	struct timeval current_time;
-+	gettimeofday(&current_time, NULL);
++	/* take fs_path either from the module parameter or construct is as
++	 * IP:PORT where the message was received */	
++	if (dbk_reg_fs_path.s) {
++		fs_path = dbk_reg_fs_path;
++	} else {
++		fs_path.s = fspath_buf;
++		fs_path.len = sprintf(fs_path.s, "%.*s:%.*s", network_ip.len, network_ip.s,
++				network_port.len, network_port.s );
++	}
++	LM_INFO("fs_path = [%.*s]\n", fs_path.len, fs_path.s);
 +
 +/*
 + * {"Network-Port":"5065","Network-IP":"178.79.172.28","FreeSWITCH-Nodename":"freeswitch@kazoo2.anca-kazoo.com","FreeSWITCH-Hostname":"kazoo2.anca-kazoo.com","RPid":"unknown","To-Host":"sip.anca-kazoo.com","To-User":"twinkle","From-Host":"sip.anca-kazoo.com","From-User":"twinkle","Presence-Hosts":"n/a","Profile-Name":"sipinterface_1","Call-ID":"msbmplhjhlbrtrg@anca-vaio","User-Agent":"Twinkle/1.4.2","Status":"Registered(UDP)","Realm":"sip.anca-kazoo.com","Username":"twinkle","Expires":"3600","Contact":"\"anca\" <sip:twinkle@109.103.86.242:62038;fs_path=<sip:178.79.172.28:5065;lr;received='sip:109.103.86.242:62038'>>","Event-Timestamp":63534134448,"Server-ID":"","Node":"ecallmgr@kazoo2.anca-kazoo.com","Msg-ID":"75535250c50683a1056811c0931c4915","App-Version":"0.8.0","App-Name":"ecallmgr","Event-Name":"reg_success","Event-Category":"directory"}
@@ -901,11 +942,11 @@ index 0000000..3679108
 + *
 + * *
 + */
-+#define NODE_NAME "ecallmgr"
++	tmb.generate_callid(&unique_string);
++	
 +	amqp_mb.len = sprintf(messagebody, "{\"Network-Port\":\"%.*s\","
 +					"\"Network-IP\":\"%.*s\","
-+					"\"FreeSWITCH-Nodename\":\"freeswitch@kazoo2.anca-kazoo.com\","
-+					"\"FreeSWITCH-Hostname\":\"kazoo2.anca-kazoo.com\","
++					"\"Kamailio-Hostname\":\"%.*s\","
 +					"\"RPid\":\"unknown\","
 +					"\"To-Host\":\"%.*s\","
 +					"\"To-User\":\"%.*s\","
@@ -919,17 +960,18 @@ index 0000000..3679108
 +					"\"Realm\":\"%.*s\","
 +					"\"Username\":\"%.*s\","
 +					"\"Expires\":\"%d\","
-+					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s:%.*s;lr;received='%.*s'>>\","
++					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s;lr;received='%.*s'>>\","
 +					"\"Event-Timestamp\":\"%ld\","
 +					"\"Server-ID\":\"\","
-+					"\"Node\":\"ecallmgr@kazoo2.anca-kazoo.com\","
-+					"\"Msg-ID\":\"75535250c50683a1056811c0931c4915\","
++					"\"Node\":\"kamailio@%.*s\","
++					"\"Msg-ID\":\"%.*s\","
 +					"\"App-Version\":\"%s\","
 +					"\"App-Name\":\"%s\","
 +					"\"Event-Name\":\"reg_success\","
 +					"\"Event-Category\":\"directory\"} ",
 +					network_port.len, network_port.s,
 +					network_ip.len, network_ip.s,
++					dbk_node_hostname.len, dbk_node_hostname.s,
 +					host.len, host.s,
 +					user.len, user.s,
 +					host.len, host.s,
@@ -940,11 +982,16 @@ index 0000000..3679108
 +					host.len, host.s,
 +					user.len, user.s,
 +					expires,
-+					user.len, user.s, user.len, user.s, received.len-4, received.s+4, network_ip.len, network_ip.s,
-+					network_port.len, network_port.s, received.len, received.s,
++					user.len, user.s,
++					user.len, user.s, received.len-4, received.s+4,
++					fs_path.len, fs_path.s,
++					//network_ip.len, network_ip.s, network_port.len, network_port.s,
++					received.len, received.s,
 +					62167219200 + (int)time(NULL),
-+			//		VERSION, NAME );
-+					"0.8.0", "ecallmgr");
++					dbk_node_hostname.len, dbk_node_hostname.s,
++					unique_string.len, unique_string.s,
++					VERSION, NAME );
++			//		"0.8.0", "ecallmgr");
 +	amqp_mb.bytes = messagebody;
 +
 +//	LM_DBG("%s\n", messagebody);
@@ -1011,16 +1058,21 @@ index 0000000..3679108
 +}
 diff --git a/modules/db_kazoo/dbase.h b/modules/db_kazoo/dbase.h
 new file mode 100644
-index 0000000..1d03668
+index 0000000..29a3a03
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.h
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,24 @@
 +#ifndef _DB_KAZOO_DBASE_
 +#define _DB_KAZOO_DBASE_
 +
 +#include "../../lib/srdb1/db.h"
 +#include "../../lib/srdb1/db_id.h"
 +#include "../../lib/srdb1/db_pool.h"
++#include "../tm/tm_load.h"
++
++extern str dbk_node_hostname;
++extern str dbk_reg_fs_path;
++extern struct tm_binds tmb;
 +
 +void* db_kazoo_new_connection(struct db_id* id);
 +
