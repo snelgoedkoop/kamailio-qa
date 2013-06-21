@@ -211,10 +211,10 @@ index 0000000..af17795
 +}
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..c0a9b0a
+index 0000000..495b5f9
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
-@@ -0,0 +1,841 @@
+@@ -0,0 +1,840 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -600,8 +600,7 @@ index 0000000..c0a9b0a
 +//	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
 +	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
 +
-+	amqp_mb.len = sprintf(messagebody, "{\"Orig-IP\":\"10.10.10.10\","
-+						"\"Method\":\"REGISTER\","
++	amqp_mb.len = sprintf(messagebody, "{\"Method\":\"REGISTER\","
 +						"\"Auth-Realm\":\"%.*s\","
 +						"\"Auth-User\":\"%.*s\","
 +						"\"From\":\"%.*s@%.*s\","
