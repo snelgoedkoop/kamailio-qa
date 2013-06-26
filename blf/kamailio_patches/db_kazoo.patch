@@ -1,0 +1,3814 @@
+diff --git a/modules/db_kazoo/Makefile b/modules/db_kazoo/Makefile
+new file mode 100644
+index 0000000..668d68c
+--- /dev/null
++++ b/modules/db_kazoo/Makefile
+@@ -0,0 +1,32 @@
++# $Id$
++#
++# WARNING: do not run this directly, it should be run by the master Makefile
++
++include ../../Makefile.defs
++auto_gen=
++NAME=db_kazoo.so
++
++DEFS+=-I/usr/local/include -DKAMAILIO_MOD_INTERFACE
++LIBS=-L/usr/local/lib -lrabbitmq -ljson
++
++DEFS += -DSER_MOD_INTERFACE
++
++ifeq ($(CROSS_COMPILE),)
++XML2CFG=$(shell which xml2-config)
++endif
++
++ifneq ($(XML2CFG),)
++	DEFS += $(shell $(XML2CFG) --cflags )
++	LIBS += $(shell $(XML2CFG) --libs)
++else
++	DEFS+=-I$(LOCALBASE)/include/libxml2 \
++		-I$(LOCALBASE)/include
++	LIBS+=-L$(LOCALBASE)/lib -lxml2
++endif
++
++
++SERLIBPATH=../../lib
++SER_LIBS=$(SERLIBPATH)/srdb2/srdb2 $(SERLIBPATH)/srdb1/srdb1
++SER_LIBS+=$(SERLIBPATH)/kmi/kmi
++
++include ../../Makefile.modules
+diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
+new file mode 100644
+index 0000000..34d1085
+--- /dev/null
++++ b/modules/db_kazoo/blf.c
+@@ -0,0 +1,1333 @@
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <amqp.h>
++#include <amqp_framing.h>
++#include <amqp_tcp_socket.h>
++#include <json/json.h>
++#include <libxml/parser.h>
++#include "../../dprint.h"
++#include "../../mem/mem.h"
++#include "../../timer_proc.h"
++#include "../../sr_module.h"
++#include "../../lib/kmi/mi.h"
++#include "../presence/bind_presence.h"
++#include "../pua_dialoginfo/bind_dialoginfo.h"
++#include "../presence_dialoginfo/bind_pres_dialoginfo.h"
++#include "../../pvar.h"
++#include "blf.h"
++#include "dbase.h"
++
++static presence_api_t presence_api;
++static pua_dialoginfo_api_t pua_dialoginfo_api;
++static pres_dialoginfo_api_t pres_dialoginfo_api;
++
++int rmqp_pres_update_handle(char* req);
++void start_presence_timer_processes(void);
++void start_presence_rmqp_consumer_processes(struct db_id* id);
++void rmqp_consumer_loop(struct db_id* id);
++int dbk_initialize_pres_htable(void);
++
++#define BLF_MAX_DIALOGS 8
++#define BLF_JSON_FROM      "From" 
++#define BLF_JSON_TO        "To"
++#define BLF_JSON_CALLID    "Call-ID"
++#define BLF_JSON_TOTAG     "To-Tag"
++#define BLF_JSON_FROMTAG   "From-Tag"
++#define BLF_JSON_STATE     "State"
++#define BLF_JSON_USER      "User"
++#define BLF_JSON_QUEUE     "Queue"
++#define BLF_JSON_EXPIRES   "Expires"
++#define BLF_APP_NAME       "App-Name"
++#define BLF_APP_VERSION    "App-Version"
++#define BLF_NODE           "Node"
++#define BLF_SERVERID       "Server-ID"
++#define BLF_EVENT_CATEGORY "Event-Category"
++#define BLF_EVENT_NAME     "Event-Name" 
++
++static char blf_queue_name_buffer[128];
++static amqp_bytes_t blf_queue;
++
++str sht_name = str_init("$sht(dbkp=>$ci)");
++pv_spec_t sht_spec;
++char node_name[128];
++
++int dbk_initialize_presence(void)
++{
++	/* bind to presence module */
++	bind_presence_t bind_presence= (bind_presence_t)find_export("bind_presence", 1,0);
++	if (!bind_presence) {
++		LM_ERR("Can't find bind presence\n");
++		return -1;
++	}
++	if (bind_presence(&presence_api) < 0) {
++		LM_ERR("Can't bind to presence api\n");
++		return -1;
++	}
++	/* bind to pua_dialoginfo module */
++	bind_pua_dialoginfo_t bind_pua_dialoginfo= (bind_pua_dialoginfo_t)find_export("bind_pua_dialoginfo", 1,0);
++	if (!bind_pua_dialoginfo) {
++		LM_ERR("Can't find bind pua_dialoginfo\n");
++		return -1;
++	}
++	if (bind_pua_dialoginfo(&pua_dialoginfo_api) < 0) {
++		LM_ERR("Can't bind to pua_dialoginfo api\n");
++		return -1;
++	}
++
++	/* bind to presence_dialoginfo module */
++	bind_pres_dialoginfo_t bind_pres_dialoginfo= (bind_pres_dialoginfo_t)find_export("bind_pres_dialoginfo", 1,0);
++	if (!bind_pres_dialoginfo) {
++		LM_ERR("Can't find bind pres_dialoginfo\n");
++		return -1;
++	}
++	if (bind_pres_dialoginfo(&pres_dialoginfo_api) < 0) {
++		LM_ERR("Can't bind to pres_dialoginfo api\n");
++		return -1;
++	}
++
++	if ( dbk_initialize_pres_htable() < 0) {
++		LM_ERR("Failed to initialize presence htable\n");
++		return -1;
++	}
++	LM_INFO("Initialized pres_htable\n");
++
++
++	if ( pv_parse_spec(&sht_name, &sht_spec) == NULL ) {
++		LM_ERR("Failed to parse sht spec\n");
++		return -1;
++	}
++
++	blf_queue.bytes = blf_queue_name_buffer;
++	blf_queue.len = sprintf(blf_queue.bytes, "BLF-%.*s", dbk_node_hostname.len, dbk_node_hostname.s);
++
++	sprintf(node_name, "kamailio@.%.*s", dbk_node_hostname.len, dbk_node_hostname.s);
++	return 0;
++}
++
++
++void dbk_start_presence_rmqp_consumer_processes(struct db_id* id)
++{
++	int i;
++	for (i= 0; i< DBK_PRES_WORKERS_NO; i++) {
++		int newpid = fork_process(PROC_NOCHLDINIT, "RMQP PRESENCE WORKER", 0);
++		if(newpid < 0) {
++			LM_ERR("failed to form process\n");
++			return;
++		} else if(newpid == 0) {
++			// child - this will loop forever
++			LM_INFO("Created dbk pres process %d\n", newpid);
++			rmqp_consumer_loop(id);
++		} else {
++			LM_INFO("Created dbk pres process %d\n", newpid);
++		}	
++	}
++}
++
++void rmqp_consumer_loop(struct db_id* id)
++{
++	amqp_frame_t frame;
++	int result;
++	amqp_basic_deliver_t *d;
++	amqp_basic_properties_t *p;
++	size_t body_target;
++	size_t body_received = 0;
++	char body[2048];
++	static amqp_bytes_t routing_key= {3, "BLF"};
++	static amqp_bytes_t exch = {10, "dialoginfo"};
++	rmq_conn_t * rconn;
++	
++	LM_INFO("Start rmqp consumer\n");
++	rconn = rmqp_new_connection(id);
++	if (rconn == NULL) {
++		LM_ERR("Failed to create rmqp connection\n");
++		return;
++	}
++	LM_INFO("Created rmqp connection\n");
++	/* Declare reply queue and start consumer */
++
++	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("fanout"),
++//	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("direct"),
++                        0, 0, amqp_empty_table);
++	if (rmq_error("Declaring exchange", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++
++	amqp_queue_declare(rconn->conn, rconn->channel, blf_queue, 0, 0, 1, 1, amqp_empty_table);
++	if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++
++	amqp_queue_bind(rconn->conn, rconn->channel, blf_queue, exch, routing_key, amqp_empty_table);
++	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++	amqp_basic_consume(rconn->conn, rconn->channel, blf_queue, amqp_empty_bytes, 0, 0, 1, amqp_empty_table);
++	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++
++	LM_INFO("Start loop\n");
++	while (1) {
++		LM_INFO("Wait for a packet\n");
++		while (1) {
++			LM_INFO("Before amqp_maybe_release_buffers\n");
++			amqp_maybe_release_buffers(rconn->conn);
++			LM_INFO("After amqp_maybe_release_buffers\n");
++			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			LM_INFO("Result: %d\n", result);
++			if (result < 0) {
++				break;
++			}
++
++			LM_INFO("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
++			if (frame.frame_type != AMQP_FRAME_METHOD) {
++				continue;
++			}
++
++			LM_INFO("Method: %s\n", amqp_method_name(frame.payload.method.id));
++		 	if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) {
++				continue;
++			}
++
++			d = (amqp_basic_deliver_t *) frame.payload.method.decoded;
++			LM_INFO("Delivery: %u exchange: %.*s routingkey: %.*s\n",
++					(unsigned) d->delivery_tag,
++					(int) d->exchange.len, (char *) d->exchange.bytes,
++					(int) d->routing_key.len, (char *) d->routing_key.bytes);
++
++			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			if (result < 0) {
++				break;
++			}
++
++			if (frame.frame_type != AMQP_FRAME_HEADER) {
++				LM_ERR("amqp: Expected header!");
++				goto error;
++			}
++			p = (amqp_basic_properties_t *) frame.payload.properties.decoded;
++			if (p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG) {
++				LM_INFO("Content-type: %.*s\n",
++				(int) p->content_type.len, (char *) p->content_type.bytes);
++			}
++			LM_INFO("----\n");
++
++			body_target = frame.payload.properties.body_size;
++			body_received = 0;
++
++			while (body_received < body_target) {
++				result = amqp_simple_wait_frame(rconn->conn, &frame);
++				if (result < 0) {
++					break;
++				}
++
++				if (frame.frame_type != AMQP_FRAME_BODY) {
++					LM_ERR("amqp: Expected header!");
++					goto error;
++				}
++
++				memcpy(body + body_received, frame.payload.body_fragment.bytes,
++						frame.payload.body_fragment.len);
++
++				body_received += frame.payload.body_fragment.len;
++
++				LM_INFO("%.*s\n", (int)frame.payload.body_fragment.len,
++						(char*)frame.payload.body_fragment.bytes);
++			}
++
++			if (body_received > body_target) {
++				LM_CRIT("Received more than expected: recv %zu, expected %zu\n",
++						body_received, body_target);
++				goto error;
++			}
++
++			if (body_received != body_target) {
++				/* Can only happen when amqp_simple_wait_frame returns <= 0 */
++				/* We break here to close the connection */
++				break;
++			}
++
++			/* everything was fine, we can quit now because we received the reply */
++			break;
++		}
++
++		body[body_received] = '\0';
++		LM_INFO("Received reply %s\n", body);
++	
++		if ( rmqp_pres_update_handle(body) < 0) {
++			LM_ERR("Failed to add to the update queue\n");
++		}
++	}
++
++error:
++	LM_ERR("Error in presence consumer loop\n");
++}
++
++typedef struct dbk_pres_dialog {
++	int version;
++	str callid;
++	str localtag;
++	str remotetag;
++	int body_size_alloc;
++	str body;
++	struct dbk_pres_dialog* next;
++} dbk_pres_dialog_t;
++
++typedef struct dbk_pres_user {
++	str user;
++	dbk_pres_dialog_t * pd;
++	struct dbk_pres_user* next;
++} dbk_pres_user_t;
++
++typedef struct {
++	gen_lock_t lock;
++	dbk_pres_user_t* pu;
++}dbk_pres_htable_t;
++
++static dbk_pres_htable_t* dbk_phtable = NULL;
++unsigned int dbk_phtable_size = 256;
++
++int dbk_initialize_pres_htable(void)
++{
++	int i;
++
++	dbk_phtable = (dbk_pres_htable_t*)shm_malloc(dbk_phtable_size*sizeof(dbk_pres_htable_t));
++	if ( dbk_phtable == NULL ) {
++		LM_ERR("No more shared memory\n");
++		return -1;
++	}
++	memset(dbk_phtable, 0, dbk_phtable_size*sizeof(dbk_pres_htable_t));
++
++	for ( i = 0; i < dbk_phtable_size; i++ ) {
++		lock_init(&dbk_phtable[i].lock);
++	}	
++
++	return 0;
++}
++
++void dbk_free_pd(dbk_pres_dialog_t* pd) 
++{
++	shm_free(pd->body.s);
++	shm_free(pd);
++}
++
++void dbk_free_pu(dbk_pres_user_t* pu)
++{
++	dbk_pres_dialog_t *pd_next;
++	dbk_pres_dialog_t *pd = pu->pd;
++	while ( pd ) {
++		pd_next = pd->next;
++		dbk_free_pd(pd);
++		pd = pd_next;
++	}
++	shm_free(pu);
++}
++
++void dbk_destroy_presence(void)
++{
++	dbk_pres_user_t *pu, *pu_next;
++	int i;
++
++	if ( dbk_phtable == NULL ) {
++		return;
++	}
++
++	for ( i = 0; i < dbk_phtable_size; i++ ) {
++		lock_destroy(&dbk_phtable[i].lock);
++		pu = dbk_phtable[i].pu;
++		while ( pu ) {
++			pu_next = pu->next;
++			dbk_free_pu(pu);
++			pu = pu_next;
++		}
++		
++	}
++	shm_free(dbk_phtable);
++}
++
++dbk_pres_user_t* dbk_pres_search_pu(unsigned int hash_code, str* user,
++	dbk_pres_user_t** pu_prev_ret, dbk_pres_user_t *prev_pu_addr)
++{
++	dbk_pres_user_t *pu, *pu_prev = NULL;
++	
++	for (pu = dbk_phtable[hash_code].pu; pu; pu = pu->next) {
++		if (prev_pu_addr && prev_pu_addr != pu) {
++			continue;
++		}
++		if (pu->user.len == user->len &&
++			 memcmp(pu->user.s, user->s, user->len)==0) {
++			break;
++		}
++		pu_prev = pu;
++	}
++	if (pu_prev_ret) {
++		*pu_prev_ret = pu_prev;
++	}
++		
++	return pu;
++}
++	
++dbk_pres_dialog_t* dbk_new_pres_dialog(str* callid, str* localtag, str* remotetag, str* body) 
++{
++	dbk_pres_dialog_t* pd = (dbk_pres_dialog_t*)shm_malloc(sizeof(dbk_pres_dialog_t) + callid->len+
++		localtag->len + remotetag->len);
++	if ( pd == NULL) {
++		LM_ERR("No more shared memory\n");
++		return NULL;
++	}	
++	memset(pd, 0, sizeof(dbk_pres_dialog_t));
++	char* p = (char*)pd + sizeof(dbk_pres_dialog_t);
++	pd->callid.s = p;
++	memcpy(pd->callid.s, callid->s, callid->len);
++	pd->callid.len = callid->len;
++	p += callid->len;
++
++	if (localtag->len) {
++		pd->localtag.s = p;
++		memcpy(pd->localtag.s, localtag->s, localtag->len);
++		pd->localtag.len = localtag->len;
++		p += localtag->len;
++	}
++	if (remotetag->len) {
++		pd->remotetag.s = p;
++		memcpy(pd->remotetag.s, remotetag->s, remotetag->len);
++		pd->remotetag.len = remotetag->len;
++		p += remotetag->len;
++	}
++
++	pd->body_size_alloc = body->len;
++	pd->body.s = (char*)shm_malloc(pd->body_size_alloc);
++	if (pd->body.s == NULL) {
++		LM_ERR("No more shared memory\n");
++		shm_free(pd);
++		return NULL;
++	}
++	memcpy(pd->body.s, body->s, body->len);
++	pd->body.len = body->len;
++	
++	return pd;	
++}
++
++dbk_pres_user_t* dbk_new_pres_user(str* user, str* callid, str* localtag, str* remotetag, str* body) 
++{
++	dbk_pres_user_t* pu = (dbk_pres_user_t*)shm_malloc(sizeof(dbk_pres_user_t) + user->len);
++	if ( pu == NULL) {
++		LM_ERR("No more shared memory\n");
++		return NULL;
++	}	
++	memset(pu, 0, sizeof(dbk_pres_user_t));
++	pu->user.s = (char*)pu + sizeof(dbk_pres_user_t);
++	memcpy(pu->user.s, user->s, user->len);
++	pu->user.len = user->len;
++	pu->pd = dbk_new_pres_dialog(callid, localtag, remotetag, body);
++	if (pu->pd == NULL) {
++		LM_ERR("Failed to construct presence dialog\n");
++		shm_free(pu);
++		return NULL;
++	}
++	return pu;
++}
++
++int dbk_pres_insert_pu(str* user, str* callid, str* localtag, str* remotetag, str* body,
++	unsigned int hash_code) 
++{
++	dbk_pres_user_t* pu = dbk_new_pres_user(user, callid, localtag, remotetag, body);
++	if (pu == NULL) {
++		LM_ERR("Failed to create new pres user\n");
++		return -1;
++	}
++
++	lock_get(&dbk_phtable[hash_code].lock);
++	pu->next = dbk_phtable[hash_code].pu;
++	dbk_phtable[hash_code].pu = pu;
++	lock_release(&dbk_phtable[hash_code].lock);
++	return 0;
++}
++
++dbk_pres_dialog_t* dbk_pres_pu_search_pd(dbk_pres_user_t* pu, str* callid, str* localtag,
++		str* remotetag, dbk_pres_dialog_t** pd_prev_ret, dbk_pres_dialog_t* prev_pd_addr) 
++{
++	dbk_pres_dialog_t *pd, *pd_prev = NULL;
++
++	for (pd = pu->pd; pd; pd = pd->next) {
++		if (prev_pd_addr && pd != prev_pd_addr)
++			continue;
++
++		if (pd->callid.len==callid->len && memcmp(pd->callid.s, callid->s, callid->len)==0 &&
++			(!localtag->len || !pd->localtag.len || (localtag->len==pd->localtag.len &&
++			memcmp(localtag->s, pd->localtag.s, localtag->len)==0)) && 
++			(!remotetag->len || !pd->remotetag.len || (remotetag->len==pd->remotetag.len &&
++			memcmp(remotetag->s, pd->remotetag.s, remotetag->len)==0)) ) {
++			break;
++		}
++
++		pd_prev = pd;
++	}
++
++	if (*pd_prev_ret) *pd_prev_ret = pd_prev;
++	return pd;
++}
++
++
++void dbk_free_xml(str* body) {
++	if (body) {
++		if (body->s)
++			xmlFree(body->s);
++		pkg_free(body);
++	}
++}
++
++int dbk_blf_copy_bodies(dbk_pres_user_t* pu, dbk_pres_dialog_t* curr_pd,
++		str* dlg_bodies, int* dlg_no) 
++{
++	dbk_pres_dialog_t* pd;
++	int i;
++
++	LM_INFO("dbk_blf_copy_bodies\n");
++
++	for (pd = pu->pd, i= *dlg_no; pd && i< BLF_MAX_DIALOGS; pd = pd->next) {
++		if ( pd == curr_pd) {
++			continue;
++		}
++		dlg_bodies[i].s = (char*) pkg_malloc(pd->body.len);
++		if (dlg_bodies[i].s == NULL) {
++			LM_ERR("No more memory\n");
++			goto error;
++		}
++		memcpy(dlg_bodies[i].s, pd->body.s, pd->body.len);
++		dlg_bodies[i].len = pd->body.len;
++		i++;
++	}
++	if (pd) {
++		LM_WARN("More dialogs than BLF_MAX_DIALOGS=%d for user [%.*s]\n",
++				BLF_MAX_DIALOGS, pu->user.len, pu->user.s);
++	}
++	*dlg_no = i;
++	return 0;
++
++error:
++	while(--i>=*dlg_no) {
++		pkg_free(dlg_bodies[i].s);
++	}
++	return -1;
++}
++
++str* dbk_blf_aggregate_body(str* user, str* dlg_bodies, int dlg_no) 
++{
++	str* dlg_bodies_p[BLF_MAX_DIALOGS];
++	struct sip_uri uri;
++	int i;
++
++	LM_INFO("Aggregate %d bodies\n", dlg_no);
++
++	if (parse_uri(user->s, user->len, &uri) < 0) {
++		LM_ERR("Failed to parse uri\n");
++		return NULL;
++	}
++
++	for (i = 0; i< dlg_no; i++) {
++		dlg_bodies_p[i] = &dlg_bodies[i];
++	}
++
++	return pres_dialoginfo_api.agg_dialoginfo(&uri.user, &uri.host, dlg_bodies_p, dlg_no);
++}
++
++str* dbk_phtable_update(str* local_user, str* remote_user, str* callid,
++	 str* localtag, str* remotetag, str* state, int initiator)
++{
++	dbk_pres_user_t* pu, *pu_prev = NULL;
++	dbk_pres_dialog_t* pd, *pd_prev = NULL;
++	unsigned int hash_code = core_hash(local_user, 0, dbk_phtable_size);
++	str* body = NULL ;
++	int terminated = strcmp(state->s, "terminated")==0?1:0;
++	str dlg_bodies[BLF_MAX_DIALOGS];
++	int dlg_no = 1;
++	int i;
++
++	if (terminated) {
++		LM_INFO("Update for terminated state\n");
++	}
++
++	LM_INFO("dbk_phtable_update: start\n");
++	lock_get(&dbk_phtable[hash_code].lock);
++	pu = dbk_pres_search_pu(hash_code, local_user, &pu_prev, 0);
++	LM_INFO("searched record\n");
++
++	/**  1. No record for user */
++	if (pu == NULL) {	
++		lock_release(&dbk_phtable[hash_code].lock);
++		LM_INFO("no record\n");
++		if (!terminated) {		
++			LM_INFO("No record found, created a new one\n");
++			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++				LM_ERR("Failed to construct BLF XML doc\n");
++				return NULL;
++			}
++			LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++
++			if ( dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code) < 0) {
++				LM_ERR("Failed to insert new pres_user in htable\n");
++			}
++			return body;
++		}
++		LM_INFO("No record found and state terminated, do nothing\n");
++		return pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
++        		initiator, localtag, remotetag, 0 , 0, 0);
++	}
++
++	pd = dbk_pres_pu_search_pd(pu, callid, localtag, remotetag, &pd_prev, 0);
++
++	/**  2. Existing record for user, no record for dialog */
++	if (pd == NULL) {
++
++		/* copy the other bodies to create the aggregated body */
++		if (pu->pd != NULL) {
++			dbk_blf_copy_bodies(pu, NULL, dlg_bodies, &dlg_no);
++		}
++		lock_release(&dbk_phtable[hash_code].lock);
++		if (!terminated) {
++			LM_INFO("Dialog record not found, insert a new one\n");
++			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++				LM_ERR("Failed to construct BLF XML doc\n");
++				goto ret_current_dialog;
++			}
++			LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++
++			pd = dbk_new_pres_dialog(callid, localtag, remotetag, body);
++			if (pd == NULL) {
++				LM_ERR("Failed to create new pres dialog\n");
++				goto ret_agg_dialogs;
++			}
++			lock_get(&dbk_phtable[hash_code].lock);
++			/* search again the corresponding pu
++ 			 * give it the prev addr to speed up the search */
++			pu = dbk_pres_search_pu(hash_code, local_user, 0, pu); 
++			if (pu == NULL) { /* pu deleted in the meantime (another dialog ended) */
++				lock_release(&dbk_phtable[hash_code].lock);
++				shm_free(pd);
++				dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code); 
++				goto ret_current_dialog;
++			}		
++			pd->next = pu->pd;
++			pu->pd = pd;
++//			pu->dlg_no++;
++			lock_release(&dbk_phtable[hash_code].lock);
++		} else { /* terminated */
++			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
++        		initiator, localtag, remotetag, 0 , 0, 0);
++		}
++		goto ret_agg_dialogs;
++	}
++
++	/**  3. Existing record for user and existing record for dialog */
++
++	/* If there are other dialogs, make a copy of the bodies */
++	if (pu->pd != pd || pd->next != NULL) {
++		dbk_blf_copy_bodies(pu, pd, dlg_bodies, &dlg_no);
++	}
++
++	if (!terminated) {
++		LM_INFO("Found record and matching dialog, update the body\n");
++		/* update only the body */
++		lock_release(&dbk_phtable[hash_code].lock);
++
++		if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++			callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++			LM_ERR("Failed to construct BLF XML doc\n");
++			goto ret_current_dialog;
++		}
++		LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++
++		lock_get(&dbk_phtable[hash_code].lock);
++		/* search again the corresponding pu;
++		 * give it the prev addr to speed up the search */
++		pu = dbk_pres_search_pu(hash_code, local_user, 0, pu); 
++		if (pu == NULL) { /* pres user deleted in the meantime (my dialog ended) */
++			lock_release(&dbk_phtable[hash_code].lock);
++			LM_INFO("pu deleted in the meantime (my dialog must have ended)\n");
++			dbk_free_xml(body);
++			body = NULL;
++			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
++		}		
++	
++		pd = dbk_pres_pu_search_pd(pu, callid, localtag, remotetag, &pd_prev, pd);
++		if (pd == NULL) {
++			lock_release(&dbk_phtable[hash_code].lock);
++			LM_INFO("pd deleted in the meantime (my dialog must have ended)\n");
++			dbk_free_xml(body);
++			body = NULL;
++			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
++		}
++
++		if (pd->body_size_alloc < body->len) {
++			pd->body_size_alloc = body->len * 2;
++			pd->body.s = (char*) shm_realloc(pd->body.s, pd->body_size_alloc);
++			if (pd->body.s == NULL) {
++				LM_ERR("No more shared memory\n");
++				lock_release(&dbk_phtable[hash_code].lock);
++				goto ret_agg_dialogs;
++			}
++		}
++		memcpy(pd->body.s, body->s, body->len);
++		pd->body.len = body->len;
++		if ( pu->pd != pd || pd->next!= NULL) {
++			lock_release(&dbk_phtable[hash_code].lock);
++			goto ret_current_dialog;
++		}
++		lock_release(&dbk_phtable[hash_code].lock);
++	} else {
++		LM_INFO("Found record and matching dialog, state terminated, delete\n");
++		if (pd_prev == NULL && pd->next == NULL) { // there is no other dialog record
++			LM_INFO("No other dialog - delete pu record\n");
++			/* delete pu */
++			if (pu_prev) {
++				pu_prev->next = pu->next;
++			} else {
++				dbk_phtable[hash_code].pu = pu->next;
++			}
++			lock_release(&dbk_phtable[hash_code].lock);
++			dbk_free_pu(pu);
++		
++			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
++        		initiator, localtag, remotetag, 0 , 0, 0);
++			goto ret_current_dialog;
++		} else {
++			LM_INFO("Other dialog - delete pd record\n");
++			/* delete pd */
++			if (pd_prev) {
++				pd_prev->next = pd->next;
++			} else {
++				pu->pd = pd->next;
++			}
++//			pu->dlg_no--;
++			lock_release(&dbk_phtable[hash_code].lock);
++			dbk_free_pd(pd);
++			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
++        		initiator, localtag, remotetag, 0 , 0, 0);
++		}
++	}
++
++ret_agg_dialogs:
++	if (dlg_no > 1) {
++		str* body_copy = body;
++		dlg_bodies[0] = *body;
++		body = dbk_blf_aggregate_body(local_user, dlg_bodies, dlg_no);
++		if (body == NULL) {
++			LM_ERR("Failed to aggregate body\n");
++			body = body_copy;
++		} else {
++			dbk_free_xml(body_copy);
++		}
++	}
++
++ret_current_dialog:
++	/* free the copied dialog bodies */
++	for(i =1; i < dlg_no; i++) {
++		pkg_free(dlg_bodies[i].s);
++	}
++
++	return body;
++}
++
++
++int dbk_pres_update_and_notify(str* local_user, str* remote_user, str* callid,
++	str* localtag, str* remotetag, str* state, int initiator) {
++
++	str event = str_init("dialog");
++	str* body;
++
++	/* update in htable */
++	if ((body = dbk_phtable_update(local_user, remote_user, callid, localtag,
++					remotetag, state, initiator)) == 0) { 
++		LM_ERR("Failed to update in htable\n");
++		return -1;
++	}
++	LM_INFO("Call notify watchers\n");
++	/* call refresh_watchers from presence */
++	if (presence_api.notify_watchers(local_user, &event, body) < 0) {
++		LM_ERR("Failed to notify watchers\n");
++		goto error;
++	}
++
++	dbk_free_xml(body);
++	return 0;
++error:
++	dbk_free_xml(body);
++	return -1;
++}
++
++#define json_extract_field(json_name, field)  do { \
++	struct json_object* obj = json_object_object_get(json_obj, json_name); \
++	if (is_error(obj)) { \
++		LM_ERR("Error parsing json: %s\n", json_tokener_errors[-(unsigned long)obj]);\
++		goto error; \
++	} \
++	field.s = (char*)json_object_get_string(obj); \
++	if (field.s == NULL) { \
++		LM_DBG("Json-c error - failed to extract field [%s]\n", json_name); \
++	} else { \
++		field.len = strlen(field.s); \
++	} \
++	LM_INFO("%s: [%s]\n", json_name, field.s?field.s:"Empty"); \
++} while (0);
++
++
++/*
++ * presence update: json format
++ * {"From": "uri", "To": "uri", "State": "state", "Callid": "callid", "From-Tag": "tag", "To-Tag": "tag"}
++ * {"Replaces": "", "Refered-By": ""}
++ * */
++int rmqp_pres_update_handle(char* req)
++{
++	str from_user={0, 0}, to_user= {0, 0};
++	str callid= {0, 0}, fromtag= {0, 0}, totag= {0, 0};
++	str state= {0, 0};
++	struct json_object *json_obj;	
++
++	/* extract info from json and construct xml */
++	json_obj = json_tokener_parse(req);
++	if (is_error(json_obj)) {
++		LM_ERR("Error parsing json: %s\n", json_tokener_errors[-(unsigned long)json_obj]);
++		goto error;
++	}
++
++	json_extract_field(BLF_JSON_FROM, from_user);
++	json_extract_field(BLF_JSON_TO, to_user);
++	json_extract_field(BLF_JSON_CALLID, callid);
++	json_extract_field(BLF_JSON_FROMTAG, fromtag);
++	json_extract_field(BLF_JSON_TOTAG, totag);
++	json_extract_field(BLF_JSON_STATE, state);
++
++	if ( !from_user.len || !to_user.len || !callid.len || !state.len) {
++		LM_ERR("Wrong formated json %s\n", req);
++		json_object_put(json_obj);
++		goto error;
++	}
++
++	dbk_pres_update_and_notify(&from_user, &to_user, &callid, &fromtag, &totag, &state, 1);
++	dbk_pres_update_and_notify(&to_user, &from_user, &callid, &totag, &fromtag, &state, 0);
++
++	json_object_put(json_obj);
++	return 0;
++error:
++	return -1;
++}
++
++str str_username_col = str_init("username");
++str str_domain_col = str_init("domain");
++str str_body_col = str_init("body");
++str str_expires_col = str_init("expires");
++str str_presentity_uri_col = str_init("presentity_uri");
++char* pres_uri_buf = NULL;
++int pres_uri_size = 0;
++
++int dbk_presence_query_expired(db1_res_t** _r) 
++{
++
++	/* TODO delete expired record */
++
++	db1_res_t* db_res = db_new_result();
++	if ( db_res == NULL ) {
++		LM_ERR("no memory left\n");
++		return -1;
++	}
++	RES_ROW_N(db_res) = 0;
++
++	*_r = db_res;
++	return 0;
++}
++
++
++int dbk_presence_query(const db1_con_t* _h, const db_key_t* _k,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc, db1_res_t** _r)
++{
++	str username = {0, 0};
++	str domain = {0, 0};
++	int i;
++	int uri_size;
++	unsigned int hash_code;
++	str pres_uri;
++	dbk_pres_user_t* pu;
++	dbk_pres_dialog_t* pd;
++	db1_res_t* db_res = NULL;
++	int col;
++	str body[BLF_MAX_DIALOGS];
++	int row_cnt = 0;
++
++
++	if (_n == 2 && _k[0]->len == str_expires_col.len &&
++		strncmp(_k[0]->s, str_expires_col.s, str_expires_col.len) == 0 ) {
++		return dbk_presence_query_expired(_r);
++	}
++
++	for ( i = 0; i< _n; i++ ) {
++		if (username.len && domain.len)
++			break;
++		if (_k[i]->len == str_username_col.len &&
++			strncmp(_k[i]->s, str_username_col.s, str_username_col.len) == 0) {
++			username = _v[i].val.str_val;
++		} else
++		if (_k[i]->len == str_domain_col.len &&
++			strncmp(_k[i]->s, str_domain_col.s, str_domain_col.len) == 0) {
++			domain = _v[i].val.str_val;	
++		}
++	} 
++	if (!username.len || !domain.len) {
++		LM_ERR("Unsupported query - expected a query after username and domain\n");
++		return -1;
++	}
++
++	uri_size = username.len + domain.len + 4;
++	if ( pres_uri_size < uri_size ) {
++		pres_uri_size = uri_size*2;
++		pres_uri_buf = (char*)pkg_realloc(pres_uri_buf, pres_uri_size);
++		if (pres_uri_buf == NULL) {
++			LM_ERR("No more private memory\n");
++			return 0;
++		}	
++	}
++	pres_uri.s = pres_uri_buf;
++	pres_uri.len = sprintf(pres_uri_buf, "sip:%.*s@%.*s", username.len, username.s, domain.len, domain.s);
++	
++	db_res = db_new_result();
++	if ( db_res == NULL ) {
++		LM_ERR("no memory left\n");
++		return -1;
++	}
++	RES_ROW_N(db_res) = 0;
++
++	memset(body, 0, BLF_MAX_DIALOGS*sizeof(str));
++	
++	/* search in hash_table*/
++	hash_code = core_hash(&pres_uri, NULL, dbk_phtable_size);
++
++	lock_get(&dbk_phtable[hash_code].lock);
++	pu = dbk_pres_search_pu(hash_code, &pres_uri, 0, 0);
++
++	if ( pu == NULL ) {
++		LM_INFO("No dialog info found for user [%.*s]\n", pres_uri.len, pres_uri.s);
++		lock_release(&dbk_phtable[hash_code].lock);
++		*_r = db_res;
++		return 0;
++	}
++	if ( pu->pd == NULL ) {
++		LM_ERR("Critical bad data in phtable: pu->pd == NULL\n");
++		goto error1;
++	}
++	pd = pu->pd;
++	row_cnt = 0;	
++	while ( pd == NULL && row_cnt < BLF_MAX_DIALOGS ) {
++		body[i].s = (char*)pkg_malloc(pu->pd->body.len + 1);
++		if (body[i].s == NULL) {
++			LM_ERR("No more shared memory\n");
++			goto error1;
++		}
++		memcpy(body[i].s, pu->pd->body.s, pu->pd->body.len);
++		body[i].len = pu->pd->body.len;
++		body[i].s[body[i].len] = '\0';
++		pd = pd->next;
++		row_cnt++;
++	} 
++
++	lock_release(&dbk_phtable[hash_code].lock);
++
++	RES_COL_N(db_res) = _nc;
++	RES_ROW_N(db_res) = row_cnt;
++	if (db_allocate_rows(db_res) < 0) {
++		LM_ERR("Could not allocate rows.\n");
++		goto error2; 
++	}
++
++	if (db_allocate_columns(db_res, RES_COL_N(db_res)) != 0) {
++		LM_ERR("Could not allocate columns\n");
++		goto error2;
++	}
++	for(col = 0; col < RES_COL_N(db_res); col++) {
++		RES_NAMES(db_res)[col] = (str*)pkg_malloc(sizeof(str));
++		if (! RES_NAMES(db_res)[col]) {
++			LM_ERR("no private memory left\n");
++			RES_COL_N(db_res) = col;
++			db_free_columns(db_res);
++			goto error2;
++		}
++		LM_DBG("Allocated %lu bytes for RES_NAMES[%d] at %p\n",
++			(unsigned long)sizeof(str), col, RES_NAMES(db_res)[col]);
++
++		RES_NAMES(db_res)[col]->s = _c[col]->s;
++		RES_NAMES(db_res)[col]->len = _c[col]->len;
++		RES_TYPES(db_res)[col] = DB1_STR;
++
++		LM_DBG("RES_NAMES(%p)[%d]=[%.*s]\n", RES_NAMES(db_res)[col], col,
++			RES_NAMES(db_res)[col]->len, RES_NAMES(db_res)[col]->s);
++	}
++
++	for (i = 0; i< row_cnt; i++ ) {
++		if (db_allocate_row(db_res, &(RES_ROWS(db_res)[i])) != 0) {
++			LM_ERR("Could not allocate row.\n");
++			RES_ROW_N(db_res) = i;
++			while(--i >= 0) {
++				RES_ROWS(db_res)[i].values[col].free  = 0;
++			}
++			goto error2; 
++		}
++
++		/* complete the row with the columns */
++		for(col = 0; col< _nc; col++) {
++			LM_INFO("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
++			RES_ROWS(db_res)[0].values[col].type = DB1_STR;
++			if (strncmp(_c[col]->s, "body", _c[col]->len) == 0 ) {
++				RES_ROWS(db_res)[i].values[col].val.str_val = body[i];
++				RES_ROWS(db_res)[i].values[col].free  = 1;
++				RES_ROWS(db_res)[i].values[col].nul  = 0;
++				LM_INFO("Body in result: [%s]\n", RES_ROWS(db_res)[i].values[col].val.string_val);
++			} else {
++				RES_ROWS(db_res)[i].values[col].val.str_val.s = "";
++				RES_ROWS(db_res)[i].values[col].val.str_val.len = 0;
++				RES_ROWS(db_res)[i].values[col].free  = 0;
++				RES_ROWS(db_res)[i].values[col].nul  = 1;
++			} 
++		}
++	}
++
++	*_r = db_res;
++	return 0;
++
++error1:
++	lock_release(&dbk_phtable[hash_code].lock);
++error2:
++	for (i = 0; i< row_cnt; i++) {
++		if (!body[i].s)
++			break;
++		pkg_free(body[i].s);
++	}
++	db_free_result(db_res);
++	return -1;
++
++}
++
++int dbk_dialoginfo_update(const db1_con_t* _h, const db_key_t* db_col,
++				const db_val_t* db_val, const int _n)
++{
++	json_object *json_object = NULL;
++	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
++	amqp_bytes_t amqp_mb;
++	static amqp_bytes_t routing_key= {3, "BLF"};
++
++	if (_n != 6) {
++		LM_ERR("Inconsistency, expected 6 columns\n");
++		return -1;
++	}
++
++	str from_user = db_val[0].val.str_val;
++	str to_user   = db_val[1].val.str_val;
++	str state     = db_val[2].val.str_val;
++	str callid    = db_val[3].val.str_val;
++	str from_tag  = db_val[4].val.str_val;
++	str to_tag    = db_val[5].val.str_val;
++
++	LM_INFO("from_user=[%.*s] to_user=[%.*s] callid=[%.*s] state=[%.*s]\n",
++		from_user.len, from_user.s, to_user.len, to_user.s, callid.len, callid.s, state.len, state.s);
++
++	/* construct json */	
++	
++	json_object = json_object_new_object();
++	if ( is_error(json_object) ) {
++		LM_ERR("Error constructing new json object: %s\n",
++			json_tokener_errors[-(unsigned long)json_object]);
++		return -1;
++	} 
++	LM_INFO("Constructed new json object\n");
++	json_object_object_add(json_object, BLF_JSON_FROM, json_object_new_string_len(from_user.s, from_user.len));
++	json_object_object_add(json_object, BLF_JSON_TO, json_object_new_string_len(to_user.s, to_user.len));
++	json_object_object_add(json_object, BLF_JSON_STATE, json_object_new_string_len(state.s, state.len));
++	json_object_object_add(json_object, BLF_JSON_CALLID, json_object_new_string_len(callid.s, callid.len));
++	json_object_object_add(json_object, BLF_JSON_FROMTAG, json_object_new_string_len(from_tag.s, from_tag.len));
++	json_object_object_add(json_object, BLF_JSON_TOTAG, json_object_new_string_len(to_tag.s, to_tag.len));
++	
++	amqp_mb.bytes = (char*)json_object_to_json_string(json_object);
++	if (amqp_mb.bytes == NULL) {
++		LM_ERR("Failed to get json string\n");
++		goto error;
++	}
++	amqp_mb.len   = strlen(amqp_mb.bytes); 
++	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++
++	/* send to rabbitmq */
++
++	LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key [%s]\n", (char*)routing_key.bytes);
++	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			rconn->exchange,
++			routing_key,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		LM_ERR("Failed to publish\n");
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++	
++	json_object_put(json_object);
++	
++	return 0;
++error:
++	if ( json_object )
++		json_object_put(json_object);
++	return -1;
++}
++
++int dbk_mi_print_pu(struct mi_node* rpl, dbk_pres_user_t* pu, int hash_code)
++{
++	dbk_pres_dialog_t* pd;
++	struct mi_node* node= NULL;
++	struct mi_node* node1 = NULL;
++	int len;
++	char* p;
++	int dlg_count = 0;
++
++	node = add_mi_node_child(rpl, 0, "User", 4, pu->user.s, pu->user.len);
++	if (node==0) {
++		LM_ERR("Failed to add User node\n");
++		goto error;
++	}
++
++	if (addf_mi_attr( node, 0, "hash", 4, "%u", hash_code) == 0) {
++		LM_ERR("Failed to add hash attribute\n");
++		goto error;
++	}
++
++	for (pd = pu->pd; pd; pd = pd->next, dlg_count++) {
++	
++		p= int2str(dlg_count, &len);
++		if ( (node1= add_mi_node_child(node, MI_DUP_VALUE, "Dialog", 6, p, len)) == 0) {
++			LM_ERR("Failed to add Dialog node\n");
++			goto error;
++		}
++
++		if (add_mi_node_child(node1, MI_DUP_VALUE, "callid", 6,
++			pd->callid.s, pd->callid.len) == 0) {
++			LM_ERR("Failed to add callid\n");
++			goto error;
++		}
++		if (add_mi_node_child(node1, MI_DUP_VALUE, "local-tag", 9,
++			pd->localtag.s, pd->localtag.len) == 0) {
++			LM_ERR("Failed to add from-tag\n");
++			goto error;
++		}
++		if (add_mi_node_child(node1, MI_DUP_VALUE, "remote-tag", 10,
++			pd->remotetag.s, pd->remotetag.len) == 0) {
++			LM_ERR("Failed to add to-tag\n");
++			goto error;
++		}
++		if (add_mi_node_child(node1, MI_DUP_VALUE, "body", 4,
++			pd->body.s, pd->body.len) == 0) {
++			LM_ERR("Failed to add body\n");
++			goto error;
++		}
++	}
++	
++	return 0;
++error:
++	return -1;
++
++}
++
++struct mi_root * dbk_phtable_dump(struct mi_root *cmd_tree, void *param)
++{
++	int i;
++	dbk_pres_user_t* pu;
++	struct mi_root* rpl_tree= NULL;
++	struct mi_node* rpl = NULL;
++
++	rpl_tree = init_mi_tree( 200, MI_SSTR(MI_OK));
++	if (rpl_tree==0)
++		return 0;
++	rpl = &rpl_tree->node;
++
++	for (i = 0; i< dbk_phtable_size; i++) {
++		lock_get(&dbk_phtable[i].lock);
++		for (pu = dbk_phtable[i].pu; pu; pu = pu->next) {
++			if (dbk_mi_print_pu(rpl, pu, i)!=0)
++				goto error;
++		}
++		lock_release(&dbk_phtable[i].lock);
++	}	
++	
++	return rpl_tree;
++
++error:
++	lock_release(&dbk_phtable[i].lock);
++	LM_ERR("Failed to print pres htable\n");
++	return 0;
++}
++
++int dbk_presence_subscribe_alert_kazoo(rmq_conn_t* rconn, str* user,unsigned int expires)
++{
++	static amqp_bytes_t exchange = {15, "dialoginfo_subs"};
++//	static amqp_bytes_t exchange = {10, "dialoginfo"};
++	static amqp_bytes_t routing_key = {15, "dialoginfo_subs"};
++	static amqp_bytes_t amqp_mb;
++	json_object *json_object = NULL;
++
++	json_object = json_object_new_object();
++	if ( is_error(json_object) ) {
++		LM_ERR("Error constructing new json object: %s\n",
++			json_tokener_errors[-(unsigned long)json_object]);
++		return -1;
++	} 
++	LM_INFO("Constructed new json object\n");
++	json_object_object_add(json_object, BLF_JSON_USER, json_object_new_string_len(user->s, user->len));
++	json_object_object_add(json_object, BLF_JSON_QUEUE, json_object_new_string_len(blf_queue.bytes, blf_queue.len));
++	json_object_object_add(json_object, BLF_JSON_EXPIRES, json_object_new_int(expires-(int)time(NULL)));
++	json_object_object_add(json_object, BLF_APP_NAME, json_object_new_string(NAME));
++	json_object_object_add(json_object, BLF_APP_VERSION, json_object_new_string(VERSION));
++	json_object_object_add(json_object, BLF_NODE, json_object_new_string(node_name));
++	json_object_object_add(json_object, BLF_SERVERID, json_object_new_string(""));
++	json_object_object_add(json_object, BLF_EVENT_CATEGORY, json_object_new_string("presence"));
++	json_object_object_add(json_object, BLF_EVENT_NAME, json_object_new_string("subscription"));
++
++	amqp_mb.bytes = (char*)json_object_to_json_string(json_object);
++	if (amqp_mb.bytes == NULL) {
++		LM_ERR("Failed to get json string\n");
++		goto error;
++	}
++	amqp_mb.len   = strlen(amqp_mb.bytes); 
++	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++
++	/* send to rabbitmq */
++
++	//LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: exchange [%.*s]\n", (int)exchange.len, (char*)exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key [%s]\n", (char*)routing_key.bytes);
++	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			exchange,
++			routing_key,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		LM_ERR("Failed to publish\n");
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++	
++	json_object_put(json_object);
++	
++	return 0;
++error:
++	if ( json_object )
++		json_object_put(json_object);
++	return -1;
++}
++
++int dbk_presence_subscribe_new(const db1_con_t* _h, const db_key_t* db_col,
++				const db_val_t* db_val, const int _n)
++{
++	unsigned int expires = 0;
++	str user= {0, 0};
++	int i;
++	struct cell* t;
++	pv_value_t value;
++
++	for (i = 0; i< _n; i++) {
++		if (db_col[i]->len == str_presentity_uri_col.len && 
++				strncmp(db_col[i]->s, str_presentity_uri_col.s, str_presentity_uri_col.len) == 0) {
++			user = db_val[i].val.str_val;
++		} else if (db_col[i]->len == str_expires_col.len && 
++				strncmp(db_col[i]->s, str_expires_col.s, str_expires_col.len) == 0) {
++			expires = db_val[i].val.int_val;
++			if (user.s) break;
++		}
++	}
++
++	LM_INFO("i=%d expires=%u\n", i, expires);
++	if (i == _n) {
++		LM_ERR("Wrong formated sql insert\n");
++		return -1;
++	}
++
++	/* save in hash table the presentity_uri for this callid */
++	t = tmb.t_gett();
++	if (t == NULL || t->uas.request == NULL) {
++		LM_ERR("No tm transaction or no sip msg found\n");
++		return -1;
++	}
++	value.flags = PV_VAL_STR;
++	value.rs = user;
++	if (pv_set_spec_value(t->uas.request, &sht_spec, 0, &value) < 0) {
++		LM_ERR("Failed to add sht value\n");
++	}
++
++
++	return dbk_presence_subscribe_alert_kazoo((rmq_conn_t*)_h->tail, &user, expires);
++}
++
++
++int dbk_presence_subscribe_update(const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un)
++{
++	unsigned int expires = 0;
++	int i;
++	struct cell* t;
++	pv_value_t value;
++
++	for (i = 0; i< _n; i++) {
++		if (_uk[i]->len == str_expires_col.len && 
++				strncmp(_uk[i]->s, str_expires_col.s, str_expires_col.len) == 0) {
++			expires = _uv[i].val.int_val;
++			break;
++		}
++	}
++
++	if (i == _n) {
++		LM_INFO("Not an expires update\n");
++		return 0;
++	}
++
++	/* get user from sht */
++	t = tmb.t_gett();
++	if (t == NULL || t->uas.request == NULL) {
++		LM_ERR("No tm transaction or no sip msg found\n");
++		return -1;
++	}
++	if (pv_get_spec_value(t->uas.request, &sht_spec, &value) < 0) {
++		LM_ERR("Failed to get sht value\n");
++		return -1;
++	}
++	LM_INFO("Found presentity uri [%.*s]\n", value.rs.len, value.rs.s);
++
++	return dbk_presence_subscribe_alert_kazoo((rmq_conn_t*)_h->tail, &value.rs, expires);
++}
++
++
+diff --git a/modules/db_kazoo/blf.h b/modules/db_kazoo/blf.h
+new file mode 100644
+index 0000000..24e7d97
+--- /dev/null
++++ b/modules/db_kazoo/blf.h
+@@ -0,0 +1,23 @@
++#ifndef _DBK_BLF_
++#define _DBK_BLF_
++
++#include "../../lib/srdb1/db_id.h"
++#include "../../mi/mi_types.h"
++
++int dbk_initialize_presence(void);
++void dbk_start_presence_rmqp_consumer_processes(struct db_id* id);
++void dbk_destroy_presence(void);
++int dbk_presence_query(const db1_con_t* _h, const db_key_t* _k,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc, db1_res_t** _r);
++int dbk_dialoginfo_update(const db1_con_t* _h, const db_key_t* db_col,
++				const db_val_t* db_val, const int _n);
++struct mi_root * dbk_phtable_dump(struct mi_root *cmd_tree, void *param);
++int dbk_presence_subscribe_new(const db1_con_t* _h, const db_key_t* db_col,
++				const db_val_t* db_val, const int _n);
++int dbk_presence_subscribe_update(const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un);
++
++#define DBK_PRES_WORKERS_NO 1
++
++#endif
+diff --git a/modules/db_kazoo/db_kazoo.c b/modules/db_kazoo/db_kazoo.c
+new file mode 100644
+index 0000000..86f8665
+--- /dev/null
++++ b/modules/db_kazoo/db_kazoo.c
+@@ -0,0 +1,186 @@
++/*
++ * $Id$
++ *
++ * Kazoo module interface
++ *
++ * Copyright (C) 2013 2600Hz
++ *
++ * This file is part of Kamailio, a free SIP server.
++ *
++ * Kamailio is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version
++ *
++ * Kamailio is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License 
++ * along with this program; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * History:
++ * --------
++ * 2013-04  first version (Anca Vamanu)
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "../../sr_module.h"
++#include "../../lib/srdb1/db.h"
++#include "../../dprint.h"
++#include "../../lib/kmi/mi.h"
++#include "../tm/tm_load.h"
++
++#include "dbase.h"
++#include "blf.h"
++
++static int mod_init(void);
++static void mod_destroy(void);
++int db_kazoo_bind_api(db_func_t *dbb);
++
++str dbk_node_hostname={0, 0};
++str dbk_reg_fs_path={0, 0};
++struct tm_binds tmb;
++
++MODULE_VERSION
++
++/*
++ *  database module interface
++ */
++static cmd_export_t cmds[] = {
++	{"db_bind_api",  (cmd_function)db_kazoo_bind_api, 0, 0, 0},
++	{0, 0, 0, 0, 0}
++};
++
++
++static param_export_t params[] = {
++	{"node_hostname",    STR_PARAM, &dbk_node_hostname.s},
++	{"register_fs_path", STR_PARAM, &dbk_reg_fs_path.s  },
++	{0, 0, 0}
++};
++static mi_export_t mi_cmds[] = {
++	{ "presence_list",    dbk_phtable_dump,   0,  0,  0},
++	{ 0, 0, 0, 0, 0}
++};
++
++struct module_exports exports = {
++	"db_kazoo",
++	DEFAULT_DLFLAGS, /* dlopen flags */
++	cmds,
++	params,          /* module parameters */
++	0,               /* exported statistics */
++	mi_cmds,         /* exported MI functions */
++	0,               /* exported pseudo-variables */
++	0,               /* extra processes */
++	mod_init,        /* module initialization function */
++	0,               /* response function*/
++	mod_destroy,     /* destroy function */
++	0                /* per-child init function */
++};
++
++static int mod_init(void)
++{
++	if(register_mi_mod(exports.name, mi_cmds)!=0)
++	{
++		LM_ERR("failed to register MI commands\n");
++		return -1;
++	}
++
++	register_procs(DBK_PRES_WORKERS_NO);
++	
++	if (dbk_node_hostname.s == NULL) {
++		LM_ERR("You must set the node_hostname parameter\n");
++		return -1;
++	}
++	dbk_node_hostname.len = strlen(dbk_node_hostname.s);
++	
++	if (dbk_reg_fs_path.s) dbk_reg_fs_path.len = strlen(dbk_reg_fs_path.s);
++
++	/* load all TM stuff */
++	if(load_tm_api(&tmb)==-1)
++	{
++		LM_ERR("Can't load tm functions. Module TM not loaded?\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++db1_con_t *db_kazoo_init(const str* _url)
++{
++	return db_do_init(_url,  (void* (*)()) db_kazoo_new_connection);
++}
++
++
++/*!
++ * \brief Close database when the database is no longer needed
++ * \param _h closed connection, as returned from db_kazoo_init
++ * \note free all memory and resources
++ */
++void db_kazoo_close(db1_con_t* _h)
++{
++	db_do_close(_h, (void (*)()) db_kazoo_free_connection);
++}
++
++/*
++ * Store name of table that will be used by
++ * subsequent database functions
++ */
++int db_kazoo_use_table(db1_con_t* _h, const str* _t)
++{
++	return db_use_table(_h, _t);
++}
++
++int db_kazoo_free_result(db1_con_t* _h, db1_res_t* _r) {
++	return db_free_result(_r);
++}
++
++int db_kazoo_delete (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const int _n)
++{	
++	return 0;
++}
++
++int db_kazoo_raw_query (const db1_con_t* _h, const str* _s, db1_res_t** _r)
++{
++	return 0;
++}
++
++int db_kazoo_replace (const db1_con_t* handle, const db_key_t* keys,
++			const db_val_t* vals, const int n, const int _un, const int _m)
++{
++	return 0;
++}
++
++int db_kazoo_bind_api(db_func_t *dbb)
++{
++	if(dbb==NULL)
++		return -1;
++
++	memset(dbb, 0, sizeof(db_func_t));
++
++	dbb->init             = db_kazoo_init;
++	dbb->use_table        = db_kazoo_use_table;
++	dbb->close            = db_kazoo_close;
++	dbb->query            = db_kazoo_query;
++	dbb->free_result      = db_kazoo_free_result;
++	dbb->insert           = db_kazoo_insert;
++	dbb->replace          = db_kazoo_replace;
++	dbb->insert_update    = db_kazoo_insert_update;
++	dbb->delete           = db_kazoo_delete;
++	dbb->update           = db_kazoo_update;
++	dbb->raw_query        = db_kazoo_raw_query;
++	dbb->cap              = DB_CAP_ALL;
++
++	return 0;
++}
++
++static void mod_destroy(void)
++{
++	dbk_destroy_presence();
++}
++
+diff --git a/modules/db_kazoo/db_kazoo.c.orig b/modules/db_kazoo/db_kazoo.c.orig
+new file mode 100644
+index 0000000..0a81dee
+--- /dev/null
++++ b/modules/db_kazoo/db_kazoo.c.orig
+@@ -0,0 +1,163 @@
++/*
++ * $Id$
++ *
++ * Kazoo module interface
++ *
++ * Copyright (C) 2013 2600Hz
++ *
++ * This file is part of Kamailio, a free SIP server.
++ *
++ * Kamailio is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version
++ *
++ * Kamailio is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License 
++ * along with this program; if not, write to the Free Software 
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
++ *
++ * History:
++ * --------
++ * 2013-04  first version (Anca Vamanu)
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++
++#include "../../sr_module.h"
++#include "../../lib/srdb1/db.h"
++#include "../../dprint.h"
++#include "../../lib/kmi/mi.h"
++
++#include "dbase.h"
++#include "blf.h"
++
++static int mod_init(void);
++static void mod_destroy(void);
++int db_kazoo_bind_api(db_func_t *dbb);
++
++MODULE_VERSION
++
++/*
++ *  database module interface
++ */
++static cmd_export_t cmds[] = {
++	{"db_bind_api",  (cmd_function)db_kazoo_bind_api, 0, 0, 0},
++	{0, 0, 0, 0, 0}
++};
++
++
++static param_export_t params[] = {
++	{0, 0, 0}
++};
++static mi_export_t mi_cmds[] = {
++	{ "presence_list",    dbk_phtable_dump,   0,  0,  0},
++	{ 0, 0, 0, 0, 0}
++};
++
++struct module_exports exports = {
++	"db_kazoo",
++	DEFAULT_DLFLAGS, /* dlopen flags */
++	cmds,
++	params,          /* module parameters */
++	0,               /* exported statistics */
++	mi_cmds,         /* exported MI functions */
++	0,               /* exported pseudo-variables */
++	0,               /* extra processes */
++	mod_init,        /* module initialization function */
++	0,               /* response function*/
++	mod_destroy,     /* destroy function */
++	0                /* per-child init function */
++};
++
++static int mod_init(void)
++{
++	if(register_mi_mod(exports.name, mi_cmds)!=0)
++	{
++		LM_ERR("failed to register MI commands\n");
++		return -1;
++	}
++
++	register_procs(DBK_PRES_WORKERS_NO);
++	return 0;
++}
++
++db1_con_t *db_kazoo_init(const str* _url)
++{
++	return db_do_init(_url,  (void* (*)()) db_kazoo_new_connection);
++}
++
++
++/*!
++ * \brief Close database when the database is no longer needed
++ * \param _h closed connection, as returned from db_kazoo_init
++ * \note free all memory and resources
++ */
++void db_kazoo_close(db1_con_t* _h)
++{
++	db_do_close(_h, (void (*)()) db_kazoo_free_connection);
++}
++
++/*
++ * Store name of table that will be used by
++ * subsequent database functions
++ */
++int db_kazoo_use_table(db1_con_t* _h, const str* _t)
++{
++	return db_use_table(_h, _t);
++}
++
++int db_kazoo_free_result(db1_con_t* _h, db1_res_t* _r) {
++	return db_free_result(_r);
++}
++
++int db_kazoo_delete (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const int _n)
++{
++	return 0;
++}
++
++int db_kazoo_raw_query (const db1_con_t* _h, const str* _s, db1_res_t** _r)
++{
++	return 0;
++}
++
++int db_kazoo_replace (const db1_con_t* handle, const db_key_t* keys,
++			const db_val_t* vals, const int n, const int _un, const int _m)
++{
++	return 0;
++}
++
++int db_kazoo_bind_api(db_func_t *dbb)
++{
++	if(dbb==NULL)
++		return -1;
++
++	memset(dbb, 0, sizeof(db_func_t));
++
++	dbb->init             = db_kazoo_init;
++	dbb->use_table        = db_kazoo_use_table;
++	dbb->close            = db_kazoo_close;
++	dbb->query            = db_kazoo_query;
++	dbb->free_result      = db_kazoo_free_result;
++	dbb->insert           = db_kazoo_insert;
++	dbb->replace          = db_kazoo_replace;
++	dbb->insert_update    = db_kazoo_insert_update;
++	dbb->delete           = db_kazoo_delete;
++	dbb->update           = db_kazoo_update;
++	dbb->raw_query        = db_kazoo_raw_query;
++	dbb->cap              = DB_CAP_ALL;
++
++	return 0;
++}
++
++static void mod_destroy(void)
++{
++	dbk_destroy_presence();
++}
++
+diff --git a/modules/db_kazoo/db_kazoo.c.rej b/modules/db_kazoo/db_kazoo.c.rej
+new file mode 100644
+index 0000000..03ad2ec
+--- /dev/null
++++ b/modules/db_kazoo/db_kazoo.c.rej
+@@ -0,0 +1,19 @@
++--- backup/db_kazoo_orig/db_kazoo.c	2013-06-19 19:42:11.000000000 +0000
+++++ modules/db_kazoo/db_kazoo.c	2013-06-21 11:20:05.000000000 +0000
++@@ -32,12 +32,16 @@
++ #include "../../sr_module.h"
++ #include "../../lib/srdb1/db.h"
++ #include "../../dprint.h"
+++#include "../tm/tm_load.h"
++ 
++ #include "dbase.h"
++ 
++ static int mod_init(void);
++ static void mod_destroy(void);
++ int db_kazoo_bind_api(db_func_t *dbb);
+++str dbk_node_hostname={0, 0};
+++str dbk_reg_fs_path={0, 0};
+++struct tm_binds tmb;
++ 
++ MODULE_VERSION
++ 
+diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
+new file mode 100644
+index 0000000..3314479
+--- /dev/null
++++ b/modules/db_kazoo/dbase.c
+@@ -0,0 +1,864 @@
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <amqp.h>
++#include <amqp_framing.h>
++#include <amqp_tcp_socket.h>
++#include <json/json.h>
++#include <sys/time.h>
++#include "../../lib/srdb1/db.h"
++#include "../../lib/srdb1/db_id.h"
++#include "../../lib/srdb1/db_pool.h"
++#include "../../dprint.h"
++#include "../../mem/mem.h"
++#include "../../sr_module.h"
++
++#include "dbase.h"
++#include "blf.h"
++
++
++void rmq_close(rmq_conn_t* rmq)
++{
++	LM_INFO("Close rmq connection\n");
++	if (!rmq)
++		return;
++	if (rmq->conn) {
++		rmq_error("closing channel",
++				amqp_channel_close(rmq->conn, rmq->channel,
++						AMQP_REPLY_SUCCESS));
++		rmq_error("closing connection",
++				amqp_connection_close(rmq->conn, AMQP_REPLY_SUCCESS));
++		if (amqp_destroy_connection(rmq->conn) < 0)
++			LM_ERR("cannot destroy connection\n");
++		rmq->conn = NULL;
++	}
++}
++
++
++void* rmqp_new_connection(struct db_id* id)
++{
++	rmq_conn_t* rmq;
++	int db_len = strlen(id->database);
++	int size = sizeof(rmq_conn_t) + db_len;
++
++
++	LM_DBG("db_kazoo_new_connection\n");
++	rmq = (rmq_conn_t*)pkg_malloc(size);
++	if (!rmq) {
++		LM_ERR("No more private memory\n");
++		return NULL;
++	}
++	memset(rmq, 0, size);
++	rmq->id = id;
++	rmq->ref = 1;
++	
++	/* exchage = dbname ( ex: callmgr ) */
++	rmq->exchange.bytes = (char*)rmq+ sizeof(rmq_conn_t);
++	memcpy(rmq->exchange.bytes, id->database, db_len);
++	rmq->exchange.len = db_len;
++
++
++	LM_INFO("Created rmq structure %p\n", rmq);
++	if (!(rmq->conn = amqp_new_connection())) {
++		LM_ERR("cannot create new connection\n");
++		goto error;
++	}
++	LM_INFO("RMQP new connection successfull!\n");
++
++	rmq->socket = amqp_tcp_socket_new();
++	if (!rmq->socket) {
++		LM_ERR("Failed to create TCP socket\n");
++		goto error;
++	}
++
++	/* TODO - take as module parameters */
++	if ( amqp_socket_open(rmq->socket, id->host, id->port) ) {
++		LM_ERR("Failed to open TCP socket\n");
++		goto error;
++	}
++	LM_INFO("RMQP open socket successfull!\n");
++
++	amqp_set_socket(rmq->conn, rmq->socket);
++
++	LM_INFO("RMQP set socket successfull!\n");
++
++	if ( rmq_error("Logging in", amqp_login(rmq->conn,
++			"/",
++			0,
++			131072,
++			0,
++			AMQP_SASL_METHOD_PLAIN,
++			id->username,
++			id->password)) ) {
++		goto error;
++	}
++	LM_INFO("RMQP login successfull!\n");
++
++	rmq->channel = process_no;
++	amqp_channel_open(rmq->conn, rmq->channel);
++	if (rmq_error("Opening channel", amqp_get_rpc_reply(rmq->conn))) {
++		goto error;
++	}
++	LM_INFO("Created channel %d\n", rmq->channel);
++
++	return rmq;
++
++error:
++	rmq_close(rmq);
++	pkg_free(rmq);
++	return NULL;
++}
++
++rmq_conn_t* dbk_dummy_db_conn(struct db_id* id)
++{
++	rmq_conn_t* rmq = (rmq_conn_t*)pkg_malloc(sizeof(rmq_conn_t));
++	if (!rmq) {
++		LM_ERR("No more private memory\n");
++		return NULL;
++	}
++	memset(rmq, 0, sizeof(rmq_conn_t));
++	rmq->id = id;
++	rmq->ref = 1;
++	LM_INFO("Return dummy db conn\n");
++	return rmq;
++}
++	
++
++int presence_initialized = 0;
++void* db_kazoo_new_connection(struct db_id* id)
++{
++	if (strncmp(id->database, "dialoginfo", 10) == 0) {
++		if ( find_export("bind_presence", 1,0) ) { /* if presence module loaded */
++			LM_INFO("Process no = %d\n", process_no);
++			if (process_no == 0 ) {
++				if (!presence_initialized) { /* called from mod_init before any fork */
++					LM_INFO("Initialize presence\n");
++					if(dbk_initialize_presence() < 0) {
++						LM_ERR("Failed to initialize db_kazoo for presence");
++						return NULL;
++					}
++					presence_initialized = 1;
++				}
++				return dbk_dummy_db_conn(id);
++			} else if (process_no == 1) { /* called from child_init */
++				LM_INFO("Start presence rmqp consumer processes\n");
++				dbk_start_presence_rmqp_consumer_processes(id);
++			}
++			
++			return rmqp_new_connection(id);
++		}
++	}
++	
++	if (process_no == 0) { /* don't initialize connection for main process */
++		return dbk_dummy_db_conn(id);
++	}
++	return rmqp_new_connection(id);
++}
++
++
++/*!
++ * \brief Close the connection and release memory
++ * \param connection
++ */
++void db_kazoo_free_connection(struct pool_con* con)
++{
++	rmq_conn_t * _c;
++	
++	LM_INFO("Close connection\n");
++
++	if (!con) return;
++	_c = (rmq_conn_t*) con;
++
++	rmq_close(_c);
++	pkg_free(_c);
++}
++
++#define KEY_SAFE(C)  ((C >= 'a' && C <= 'z') || \
++                      (C >= 'A' && C <= 'Z') || \
++                      (C >= '0' && C <= '9') || \
++                      (C == '-' || C == '~'  || C == '_'))
++
++#define HI4(C) (C>>4)
++#define LO4(C) (C & 0x0F)
++
++
++#define hexint(C) (C < 10?('0' + C):('A'+ C - 10))
++
++char* amqp_util_encode(const str* key, char* dest)
++{
++	if ( (key->len == 1) && (key->s[0] == '#' || key->s[0] == '*') ) {
++		*dest++ = key->s[0];
++		return dest;
++	}
++	char* p, *end;
++	for (p = key->s, end = key->s + key->len; p < end; p++) {
++		if (KEY_SAFE(*p)) {
++			*dest++= *p;
++		} else if (*p == '.' ) {
++			memcpy(dest, "\%2E", 3);
++			dest+= 3;
++		} else if (*p == ' ') {
++			*dest++ = '+';
++		} else {
++			*dest++='%';
++			sprintf(dest, "%c%c", hexint(HI4(*p)), hexint(LO4(*p)));
++			dest+=2;
++		}
++	}
++	return dest;
++}
++
++#if 0
++encode(<<"*">>) -> <<"*">>;
++encode(<<"#">>) -> <<"#">>;
++encode(Bin) -> << <<(encode_char(B))/binary>> || <<B>> <= Bin >>.
++
++-define(HI4(C), (C band 2#11110000) bsr 4).
++-define(LO4(C), (C band 2#00001111)).
++
++encode_char(C) when ?KEY_SAFE(C) -> <<C>>;
++encode_char($\s) -> <<$+>>;
++encode_char($.) -> <<$%, $2, $E>>;
++encode_char(C) ->
++    Hi4 = ?HI4(C),
++    Lo4 = ?LO4(C),
++    <<$%, (hexint(Hi4)), (hexint(Lo4))>>.
++
++}
++#endif
++
++#define AUTH_ROUTING_KEY_PREFIX "authn.req."
++#define AUTH_ROUTING_KEY_PREFIX_LEN sizeof("authn.req.") - 1
++
++#define REG_ROUTING_KEY_PREFIX "registration.success."
++#define REG_ROUTING_KEY_PREFIX_LEN sizeof("registration.success.") - 1
++
++static unsigned long rpl_routing_key_count = 0;
++
++db1_res_t* dbk_creds_build_result(char* body, const db_key_t* _c, int _nc) {
++	struct json_object *json_obj;	
++	struct json_object *init_json_obj = NULL;	
++	db1_res_t* db_res = 0;
++	str password;
++	int col;
++
++	db_res = db_new_result();
++	if (!db_res) {
++		LM_ERR("no memory left\n");
++		return NULL;
++	}
++	RES_ROW_N(db_res) = 0;
++
++	json_obj = json_tokener_parse(body);
++	if (is_error(json_obj)) {
++		LM_ERR("Error parsing json: %s\n",
++		       json_tokener_errors[-(unsigned long)json_obj]);
++		goto error;
++	}
++	init_json_obj = json_obj;
++
++	struct json_object* password_obj = json_object_object_get(json_obj, "Auth-Password");
++	if (is_error(json_obj)) {
++		LM_ERR("Error parsing json: %s\n",
++		       json_tokener_errors[-(unsigned long)json_obj]);
++		goto error;
++	}
++	password.s = (char*)json_object_get_string(password_obj);
++	if (password.s == NULL) {
++		LM_ERR("Json-c error - failed to extract password [%s]\n", body);
++		goto error;
++	}
++	password.len = strlen(password.s);
++	LM_INFO("Password: [%s]\n", password.s);
++
++	RES_COL_N(db_res) = _nc;
++	RES_ROW_N(db_res) = 1;
++	if (db_allocate_rows(db_res) < 0) {
++		LM_ERR("Could not allocate rows.\n");
++		goto error; 
++	}
++
++	if (db_allocate_columns(db_res, RES_COL_N(db_res)) != 0) {
++		LM_ERR("Could not allocate columns\n");
++		goto error;
++	}
++	if (db_allocate_row(db_res, &(RES_ROWS(db_res)[0])) != 0) {
++		LM_ERR("Could not allocate row.\n");
++		goto error; 
++	}
++
++	for(col = 0; col < RES_COL_N(db_res); col++) {
++		RES_NAMES(db_res)[col] = (str*)pkg_malloc(sizeof(str));
++		if (! RES_NAMES(db_res)[col]) {
++			LM_ERR("no private memory left\n");
++			RES_COL_N(db_res) = col;
++			db_free_columns(db_res);
++			goto error;
++		}
++		LM_DBG("Allocated %lu bytes for RES_NAMES[%d] at %p\n",
++			(unsigned long)sizeof(str), col, RES_NAMES(db_res)[col]);
++
++		RES_NAMES(db_res)[col]->s = _c[col]->s;
++		RES_NAMES(db_res)[col]->len = _c[col]->len;
++		RES_TYPES(db_res)[col] = DB1_STR;
++
++		LM_DBG("RES_NAMES(%p)[%d]=[%.*s]\n", RES_NAMES(db_res)[col], col,
++			RES_NAMES(db_res)[col]->len, RES_NAMES(db_res)[col]->s);
++	}
++
++
++	/* complete the row with the columns */
++	for(col = 0; col< _nc; col++) {
++		LM_INFO("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
++		RES_ROWS(db_res)[0].values[col].type = DB1_STR;
++		if (strncmp(_c[col]->s, "password", _c[col]->len) == 0 ) {
++			LM_INFO("Wrote the password in the result\n");
++				
++			RES_ROWS(db_res)[0].values[col].val.str_val.s = (char*)pkg_malloc(password.len+1);
++			if (RES_ROWS(db_res)[0].values[col].val.str_val.s==NULL) {
++				PKG_MEM_ERROR;
++				goto error;
++			}
++			strcpy(RES_ROWS(db_res)[0].values[col].val.str_val.s, password.s);
++			RES_ROWS(db_res)[0].values[col].val.str_val.len = password.len;
++
++			RES_ROWS(db_res)[0].values[col].free  = 1;
++			RES_ROWS(db_res)[0].values[col].nul  = 0;
++			LM_INFO("Password in result: [%s]\n", RES_ROWS(db_res)[0].values[col].val.string_val);
++		} else {
++			RES_ROWS(db_res)[0].values[col].val.str_val.s = "";
++			RES_ROWS(db_res)[0].values[col].val.str_val.len = 0;
++			RES_ROWS(db_res)[0].values[col].free  = 0;
++			RES_ROWS(db_res)[0].values[col].nul  = 1;
++		} 
++	}
++//	RES_ROW_N(db_res) = 1;
++
++	/* decrement the reference of the object*/
++	json_object_put(init_json_obj);
++
++	return db_res;
++
++error:
++	if(init_json_obj)
++		json_object_put(init_json_obj);
++	return db_res;
++	
++}	
++
++
++int dbk_credentials_query(const db1_con_t* _h, const db_key_t* _k,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc, db1_res_t** _r)
++{
++	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
++	static char routingkey[256];
++	static char messagebody[2024];
++	static char serverid[256];
++	amqp_bytes_t amqp_rk;
++	amqp_bytes_t amqp_mb;
++	amqp_bytes_t rpl_queue= {0, 0};
++	str unique_string = {0, 0};
++
++	LM_INFO("RMQ struct %p\n", rconn);
++
++	/* routingkey = authn.req._auth_realm_ */
++	amqp_rk.bytes = routingkey;
++	memcpy(routingkey, AUTH_ROUTING_KEY_PREFIX, AUTH_ROUTING_KEY_PREFIX_LEN);
++	amqp_rk.len = amqp_util_encode(&_v[1].val.str_val, routingkey+AUTH_ROUTING_KEY_PREFIX_LEN) - routingkey;
++	if (amqp_rk.len < AUTH_ROUTING_KEY_PREFIX_LEN + _v[1].val.str_val.len) {
++		LM_ERR("Encoding didn't succeed %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++		return -1;
++	}
++
++	tmb.generate_callid(&unique_string);
++	/* construct messagebody */
++
++//	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
++	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
++
++	amqp_mb.len = sprintf(messagebody, "{\"Method\":\"REGISTER\","
++						"\"Auth-Realm\":\"%.*s\","
++						"\"Auth-User\":\"%.*s\","
++						"\"From\":\"%.*s@%.*s\","
++						"\"To\":\"%.*s@%.*s\","
++						"\"Server-ID\":\"%s\","
++						"\"Node\":\"kamailio@%.*s\","
++						"\"Msg-ID\":\"%.*s\","
++						"\"App-Version\":\"%s\","
++						"\"App-Name\":\"%s\","
++						"\"Event-Name\":\"authn_req\","
++						"\"Event-Category\":\"directory\"}",
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						serverid,
++						dbk_node_hostname.len, dbk_node_hostname.s,
++						unique_string.len, unique_string.s,
++						VERSION, NAME);
++	amqp_mb.bytes = messagebody;
++
++	LM_INFO("AMQP: exchange %.*s\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_INFO("AMQP: body: %s\n", messagebody);
++	
++	/* Declare reply queue and start consumer */
++	amqp_bytes_t rpl_routing_key= {strlen(serverid), serverid};
++
++	LM_INFO("AMQP: before queue_declare rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	amqp_queue_declare_ok_t *r = amqp_queue_declare(rconn->conn, rconn->channel, amqp_empty_bytes, 0, 0, 1, 1,
++								 amqp_empty_table);
++	if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++    	rpl_queue = amqp_bytes_malloc_dup(r->queue);
++    	if (rpl_queue.bytes == NULL) {
++      		LM_ERR("Out of memory while copying queue name\n");
++      		goto error;
++	}
++
++	amqp_bytes_t rpl_exch = {8, "targeted"};
++	amqp_queue_bind(rconn->conn, rconn->channel, rpl_queue, rpl_exch, rpl_routing_key, amqp_empty_table);
++	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++	LM_INFO("AMQP: after queue_bind  rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	LM_INFO("AMQP: after queue_bind  server_id: [%s]\n", serverid);
++		/*
++	publish
++	*/
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			rconn->exchange,
++			amqp_rk,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++
++	amqp_basic_consume(rconn->conn, rconn->channel, rpl_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
++	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++
++	amqp_frame_t frame;
++	int result;
++
++	amqp_basic_deliver_t *d;
++	amqp_basic_properties_t *p;
++	size_t body_target;
++	size_t body_received = 0;
++	char body[2048];
++
++	while (1) {
++		LM_INFO("Before amqp_maybe_release_buffers\n");
++		amqp_maybe_release_buffers(rconn->conn);
++		LM_INFO("After amqp_maybe_release_buffers\n");
++		result = amqp_simple_wait_frame(rconn->conn, &frame);
++		LM_INFO("Result: %d\n", result);
++		if (result < 0) {
++			break;
++		}
++
++		LM_INFO("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
++		if (frame.frame_type != AMQP_FRAME_METHOD) {
++			continue;
++		}
++
++		LM_INFO("Method: %s\n", amqp_method_name(frame.payload.method.id));
++		if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) {
++			continue;
++		}
++
++		d = (amqp_basic_deliver_t *) frame.payload.method.decoded;
++		LM_INFO("Delivery: %u exchange: %.*s routingkey: %.*s\n",
++				(unsigned) d->delivery_tag,
++				(int) d->exchange.len, (char *) d->exchange.bytes,
++				(int) d->routing_key.len, (char *) d->routing_key.bytes);
++
++		result = amqp_simple_wait_frame(rconn->conn, &frame);
++		if (result < 0) {
++			break;
++		}
++
++		if (frame.frame_type != AMQP_FRAME_HEADER) {
++			LM_ERR("amqp: Expected header!");
++			goto error;
++		}
++		p = (amqp_basic_properties_t *) frame.payload.properties.decoded;
++		if (p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG) {
++			LM_INFO("Content-type: %.*s\n",
++			(int) p->content_type.len, (char *) p->content_type.bytes);
++		}
++		LM_INFO("----\n");
++
++		body_target = frame.payload.properties.body_size;
++		body_received = 0;
++
++		while (body_received < body_target) {
++			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			if (result < 0) {
++				break;
++			}
++
++			if (frame.frame_type != AMQP_FRAME_BODY) {
++				LM_ERR("amqp: Expected header!");
++				goto error;
++			}
++
++			memcpy(body + body_received, frame.payload.body_fragment.bytes,
++					frame.payload.body_fragment.len);
++
++			body_received += frame.payload.body_fragment.len;
++
++			LM_INFO("%.*s\n", (int)frame.payload.body_fragment.len,
++					(char*)frame.payload.body_fragment.bytes);
++		}
++
++		if (body_received > body_target) {
++			LM_CRIT("Received more than expected: recv %zu, expected %zu\n",
++					body_received, body_target);
++			goto error;
++		}
++
++		if (body_received != body_target) {
++			/* Can only happen when amqp_simple_wait_frame returns <= 0 */
++			/* We break here to close the connection */
++			break;
++		}
++
++		/* everything was fine, we can quit now because we received the reply */
++		break;
++	}
++
++	body[body_received] = '\0';
++	LM_INFO("Received reply %s\n", body);
++
++	amqp_queue_purge(rconn->conn, rconn->channel, rpl_queue);
++	if (rmq_error("Purging reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to purge reply queue\n");
++	}
++	
++	LM_INFO("rpl_queue [%.*s], rpl_exchange [%.*s], rpl_routing_key [%.*s]\n",
++		 (int)rpl_queue.len, (char*)rpl_queue.bytes, 
++		 (int)rpl_exch.len, (char*)rpl_exch.bytes, 
++		 (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes 
++		);
++	amqp_queue_unbind(rconn->conn, rconn->channel, rpl_queue, rpl_exch,  rpl_routing_key, amqp_empty_table);	
++	if (rmq_error("Unbinding reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to unbind queue\n");
++	}
++	amqp_queue_delete(rconn->conn, rconn->channel, rpl_queue, 0, 0);
++	if (rmq_error("Deleting reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to delete queue\n");
++	}
++	LM_INFO("rpl_queue [%.*s]\n", (int)rpl_queue.len, (char*)rpl_queue.bytes);
++
++	/* parse json and extract password */
++	db1_res_t* db_res = dbk_creds_build_result(body, _c, _nc);	
++	*_r = db_res;
++	amqp_bytes_free(rpl_queue);
++	return 0;
++error:
++	if(rpl_queue.bytes)
++		amqp_bytes_free(rpl_queue);
++	return -1;
++}
++
++db1_res_t* db_empty_result(void)
++{
++	db1_res_t* db_res = db_new_result();
++	if (!db_res) {
++		LM_ERR("no memory left\n");
++		return NULL;
++	}
++	RES_ROW_N(db_res) = 0;
++	return db_res;
++}
++
++/*
++ * Query table for specified rows
++ * _h: structure representing database connection
++ * _k: key names
++ * _op: operators
++ * _v: values of the keys that must match
++ * _c: column names to return
++ * _n: number of key=values pairs to compare
++ * _nc: number of columns to return
++ * _o: order by the specified column
++ */
++int db_kazoo_query(const db1_con_t* _h, const db_key_t* _k, const db_op_t* _op,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc,
++		const db_key_t _o, db1_res_t** _r)
++{
++	if (!_h || !CON_TABLE(_h) || !_r) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("query table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "subscriber", 10)== 0 ) {
++		return dbk_credentials_query(_h, _k, _v, _c, _n, _nc, _r);
++	} else if(strncmp(_h->table->s, "presentity", 10)== 0 ) {
++		return dbk_presence_query(_h, _k, _v, _c, _n, _nc, _r);
++	} else {
++		LM_INFO("Not supported\n");
++		*_r = db_empty_result();
++		return 0;
++	}
++}
++
++int amqp_register_notice(const db1_con_t* _h, const db_key_t* _k,
++                            	const db_val_t* _v, const int _n) {
++
++	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
++	static char routingkey[256];
++	static char messagebody[2024];
++	static char fspath_buf[64];
++	amqp_bytes_t amqp_rk;
++	amqp_bytes_t amqp_mb;
++	int col;
++	str unique_string;
++	str fs_path;
++
++	/* construct messagebody */
++
++	str user= {0,0};
++	str contact = {0, 0};
++	int expires = 0;
++	
++	str callid = {0, 0};
++	str user_agent = {0, 0};
++	str network_ip = {0, 0};
++	str network_port = {0, 0};
++	str network_proto = {0, 0};
++	str host = {0, 0};
++	str received = {0, 0};
++
++	for (col = 0; col < _n; col ++) {
++		if (!user.len && strncmp(_k[col]->s, "username", 8) == 0) {
++			user = _v[col].val.str_val;
++		} else if (!contact.len && strncmp(_k[col]->s, "contact", 7) == 0) {
++			contact = _v[col].val.str_val;
++		} else if (!expires && strncmp(_k[col]->s, "expires", 7) == 0) {
++			expires= _v[col].val.int_val - (int)time(NULL);
++		} else if (!callid.len && strncmp(_k[col]->s, "callid", 6) == 0) {
++			callid = _v[col].val.str_val;
++		} else if (!user_agent.len && strncmp(_k[col]->s, "user_agent", 10) == 0) {
++			user_agent = _v[col].val.str_val;
++		} else if (!host.len && strncmp(_k[col]->s, "domain", 6) == 0) {
++			host = _v[col].val.str_val;
++		} else if (!network_ip.len && strncmp(_k[col]->s, "socket", 6) == 0) {
++	
++			char* dp = memchr( _v[col].val.str_val.s, ':',  _v[col].val.str_val.len);
++			if (dp == NULL) {
++				LM_ERR("Wrong formated socket uri %.*s\n",
++					  _v[col].val.str_val.len, _v[col].val.str_val.s);
++				goto error;
++			}		
++			network_proto.s = _v[col].val.str_val.s;	
++			network_proto.len = dp - network_proto.s;	
++		
++			dp++;
++			network_ip.s = dp;	
++			dp = memchr(dp, ':',  _v[col].val.str_val.len- network_proto.len -1);
++			if (dp == NULL) {
++				LM_ERR("Wrong formated socket uri %.*s\n",
++					  _v[col].val.str_val.len, _v[col].val.str_val.s);
++				goto error;
++			}		
++			network_ip.len = dp - network_ip.s;
++
++			network_port.s = dp + 1;
++			network_port.len = _v[col].val.str_val.s + _v[col].val.str_val.len - network_port.s;
++		} else if (!received.len && strncmp(_k[col]->s, "received", 8) == 0) {
++			received = _v[col].val.str_val;
++		}
++	}
++
++	LM_INFO("user = [%.*s]\n", user.len, user.s);
++	LM_INFO("host = [%.*s]\n", host.len, host.s);
++	LM_INFO("contact = [%.*s]\n", contact.len, contact.s);
++	LM_INFO("received = [%.*s]\n", received.len, received.s);
++
++	/* take fs_path either from the module parameter or construct is as
++	 * IP:PORT where the message was received */	
++	if (dbk_reg_fs_path.s) {
++		fs_path = dbk_reg_fs_path;
++	} else {
++		fs_path.s = fspath_buf;
++		fs_path.len = sprintf(fs_path.s, "%.*s:%.*s", network_ip.len, network_ip.s,
++				network_port.len, network_port.s );
++	}
++	LM_INFO("fs_path = [%.*s]\n", fs_path.len, fs_path.s);
++
++/*
++ * {"Network-Port":"5065","Network-IP":"178.79.172.28","FreeSWITCH-Nodename":"freeswitch@kazoo2.anca-kazoo.com","FreeSWITCH-Hostname":"kazoo2.anca-kazoo.com","RPid":"unknown","To-Host":"sip.anca-kazoo.com","To-User":"twinkle","From-Host":"sip.anca-kazoo.com","From-User":"twinkle","Presence-Hosts":"n/a","Profile-Name":"sipinterface_1","Call-ID":"msbmplhjhlbrtrg@anca-vaio","User-Agent":"Twinkle/1.4.2","Status":"Registered(UDP)","Realm":"sip.anca-kazoo.com","Username":"twinkle","Expires":"3600","Contact":"\"anca\" <sip:twinkle@109.103.86.242:62038;fs_path=<sip:178.79.172.28:5065;lr;received='sip:109.103.86.242:62038'>>","Event-Timestamp":63534134448,"Server-ID":"","Node":"ecallmgr@kazoo2.anca-kazoo.com","Msg-ID":"75535250c50683a1056811c0931c4915","App-Version":"0.8.0","App-Name":"ecallmgr","Event-Name":"reg_success","Event-Category":"directory"}
++ *
++ * *
++ */
++	tmb.generate_callid(&unique_string);
++
++	amqp_mb.len = sprintf(messagebody, "{\"Network-Port\":\"%.*s\","
++					"\"Network-IP\":\"%.*s\","
++					"\"Kamailio-Hostname\":\"%.*s\","
++					"\"RPid\":\"unknown\","
++					"\"To-Host\":\"%.*s\","
++					"\"To-User\":\"%.*s\","
++					"\"From-Host\":\"%.*s\","
++					"\"From-User\":\"%.*s\","
++					"\"Presence-Hosts\":\"n/a\","
++					"\"Profile-Name\":\"sipinterface_1\","
++					"\"Call-ID\":\"%.*s\","
++					"\"User-Agent\":\"%.*s\","
++					"\"Status\":\"Registered(%.*s)\","
++					"\"Realm\":\"%.*s\","
++					"\"Username\":\"%.*s\","
++					"\"Expires\":\"%d\","
++					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s;lr;received='%.*s'>>\","
++					"\"Event-Timestamp\":\"%ld\","
++					"\"Server-ID\":\"\","
++					"\"Node\":\"kamailio@%.*s\","
++					"\"Msg-ID\":\"%.*s\","
++					"\"App-Version\":\"%s\","
++					"\"App-Name\":\"%s\","
++					"\"Event-Name\":\"reg_success\","
++					"\"Event-Category\":\"directory\"} ",
++					network_port.len, network_port.s,
++					network_ip.len, network_ip.s,
++					dbk_node_hostname.len, dbk_node_hostname.s,
++					host.len, host.s,
++					user.len, user.s,
++					host.len, host.s,
++					user.len, user.s,
++					callid.len, callid.s,
++					user_agent.len, user_agent.s,
++					network_proto.len, network_proto.s,
++					host.len, host.s,
++					user.len, user.s,
++					expires,
++					user.len, user.s,
++					user.len, user.s, received.len-4, received.s+4,
++					fs_path.len, fs_path.s,
++					//network_ip.len, network_ip.s, network_port.len, network_port.s,
++					received.len, received.s,
++					62167219200 + (int)time(NULL),
++					dbk_node_hostname.len, dbk_node_hostname.s,
++					unique_string.len, unique_string.s,
++					VERSION, NAME );
++			//		"0.8.0", "ecallmgr");
++	amqp_mb.bytes = messagebody;
++
++//	LM_DBG("%s\n", messagebody);
++
++	/* routingkey = registration.success._host_._user_ (restration.success.sip%2Eanca-kazoo%2Ecom.twinkle)  */
++	amqp_rk.bytes = routingkey;
++	memcpy(routingkey, REG_ROUTING_KEY_PREFIX, REG_ROUTING_KEY_PREFIX_LEN);
++	amqp_rk.len = amqp_util_encode(&host, routingkey+REG_ROUTING_KEY_PREFIX_LEN) - routingkey;
++	routingkey[amqp_rk.len++]='.';
++	amqp_rk.len = amqp_util_encode(&user, routingkey+amqp_rk.len) - routingkey;
++	if (amqp_rk.len < REG_ROUTING_KEY_PREFIX_LEN + host.len + user.len) {
++		LM_ERR("Encoding didn't succeed %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++		return -1;
++	}
++
++	LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key [%.*s]\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_INFO("AMQP: body: %s\n", messagebody);
++	
++	/*
++		publish
++	*/
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			rconn->exchange,
++			amqp_rk,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		LM_ERR("Failed to publish\n");
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++	return 0;
++
++error:
++	return -1;
++}
++
++int db_kazoo_insert (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n)
++{
++	if (!_h || !CON_TABLE(_h) ) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("insert into table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "location", _h->table->len)  == 0) {
++		return amqp_register_notice(_h, _k, _v, _n);
++	} else if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
++		return dbk_presence_subscribe_new(_h, _k, _v, _n);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
++
++
++int db_kazoo_insert_update (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n)
++{
++	if (!_h || !CON_TABLE(_h) ) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("insert into table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "dialoginfo", _h->table->len)  == 0) {
++		LM_INFO("Insert update called for dialoginfo table\n");
++		return dbk_dialoginfo_update(_h, _k, _v, _n);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
++
++int db_kazoo_update (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un) {
++	if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
++		LM_INFO("Update called for active_watchers table\n");
++		return dbk_presence_subscribe_update(_h, _k, _v, _uk, _uv, _n, _un);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
+diff --git a/modules/db_kazoo/dbase.c.orig b/modules/db_kazoo/dbase.c.orig
+new file mode 100644
+index 0000000..520c643
+--- /dev/null
++++ b/modules/db_kazoo/dbase.c.orig
+@@ -0,0 +1,844 @@
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <amqp.h>
++#include <amqp_framing.h>
++#include <amqp_tcp_socket.h>
++#include <json/json.h>
++#include <sys/time.h>
++#include "../../lib/srdb1/db.h"
++#include "../../lib/srdb1/db_id.h"
++#include "../../lib/srdb1/db_pool.h"
++#include "../../dprint.h"
++#include "../../mem/mem.h"
++#include "../../sr_module.h"
++
++#include "dbase.h"
++#include "blf.h"
++
++
++void rmq_close(rmq_conn_t* rmq)
++{
++	LM_INFO("Close rmq connection\n");
++	if (!rmq)
++		return;
++	if (rmq->conn) {
++		rmq_error("closing channel",
++				amqp_channel_close(rmq->conn, rmq->channel,
++						AMQP_REPLY_SUCCESS));
++		rmq_error("closing connection",
++				amqp_connection_close(rmq->conn, AMQP_REPLY_SUCCESS));
++		if (amqp_destroy_connection(rmq->conn) < 0)
++			LM_ERR("cannot destroy connection\n");
++		rmq->conn = NULL;
++	}
++}
++
++
++void* rmqp_new_connection(struct db_id* id)
++{
++	rmq_conn_t* rmq;
++	int db_len = strlen(id->database);
++	int size = sizeof(rmq_conn_t) + db_len;
++
++
++	LM_DBG("db_kazoo_new_connection\n");
++	rmq = (rmq_conn_t*)pkg_malloc(size);
++	if (!rmq) {
++		LM_ERR("No more private memory\n");
++		return NULL;
++	}
++	memset(rmq, 0, size);
++	rmq->id = id;
++	rmq->ref = 1;
++	
++	/* exchage = dbname ( ex: callmgr ) */
++	rmq->exchange.bytes = (char*)rmq+ sizeof(rmq_conn_t);
++	memcpy(rmq->exchange.bytes, id->database, db_len);
++	rmq->exchange.len = db_len;
++
++
++	LM_INFO("Created rmq structure %p\n", rmq);
++	if (!(rmq->conn = amqp_new_connection())) {
++		LM_ERR("cannot create new connection\n");
++		goto error;
++	}
++	LM_INFO("RMQP new connection successfull!\n");
++
++	rmq->socket = amqp_tcp_socket_new();
++	if (!rmq->socket) {
++		LM_ERR("Failed to create TCP socket\n");
++		goto error;
++	}
++
++	/* TODO - take as module parameters */
++	if ( amqp_socket_open(rmq->socket, id->host, id->port) ) {
++		LM_ERR("Failed to open TCP socket\n");
++		goto error;
++	}
++	LM_INFO("RMQP open socket successfull!\n");
++
++	amqp_set_socket(rmq->conn, rmq->socket);
++
++	LM_INFO("RMQP set socket successfull!\n");
++
++	if ( rmq_error("Logging in", amqp_login(rmq->conn,
++			"/",
++			0,
++			131072,
++			0,
++			AMQP_SASL_METHOD_PLAIN,
++			id->username,
++			id->password)) ) {
++		goto error;
++	}
++	LM_INFO("RMQP login successfull!\n");
++
++	rmq->channel = process_no;
++	amqp_channel_open(rmq->conn, rmq->channel);
++	if (rmq_error("Opening channel", amqp_get_rpc_reply(rmq->conn))) {
++		goto error;
++	}
++	LM_INFO("Created channel %d\n", rmq->channel);
++
++	return rmq;
++
++error:
++	rmq_close(rmq);
++	pkg_free(rmq);
++	return NULL;
++}
++
++rmq_conn_t* dbk_dummy_db_conn(struct db_id* id)
++{
++	rmq_conn_t* rmq = (rmq_conn_t*)pkg_malloc(sizeof(rmq_conn_t));
++	if (!rmq) {
++		LM_ERR("No more private memory\n");
++		return NULL;
++	}
++	memset(rmq, 0, sizeof(rmq_conn_t));
++	rmq->id = id;
++	rmq->ref = 1;
++	LM_INFO("Return dummy db conn\n");
++	return rmq;
++}
++	
++
++int presence_initialized = 0;
++void* db_kazoo_new_connection(struct db_id* id)
++{
++	if (strncmp(id->database, "dialoginfo", 10) == 0) {
++		if ( find_export("bind_presence", 1,0) ) { /* if presence module loaded */
++			LM_INFO("Process no = %d\n", process_no);
++			if (process_no == 0 ) {
++				if (!presence_initialized) { /* called from mod_init before any fork */
++					LM_INFO("Initialize presence\n");
++					dbk_initialize_presence();
++					presence_initialized = 1;
++				}
++				return dbk_dummy_db_conn(id);
++			} else if (process_no == 1) { /* called from child_init */
++				LM_INFO("Start presence rmqp consumer processes\n");
++				dbk_start_presence_rmqp_consumer_processes(id);
++			}
++			
++			return rmqp_new_connection(id);
++		}
++	}
++	
++	if (process_no == 0) { /* don't initialize connection for main process */
++		return rmqp_new_connection(id);
++	}
++	return dbk_dummy_db_conn(id);
++}
++
++
++/*!
++ * \brief Close the connection and release memory
++ * \param connection
++ */
++void db_kazoo_free_connection(struct pool_con* con)
++{
++	rmq_conn_t * _c;
++	
++	LM_INFO("Close connection\n");
++
++	if (!con) return;
++	_c = (rmq_conn_t*) con;
++
++	rmq_close(_c);
++	pkg_free(_c);
++}
++
++#define KEY_SAFE(C)  ((C >= 'a' && C <= 'z') || \
++                      (C >= 'A' && C <= 'Z') || \
++                      (C >= '0' && C <= '9') || \
++                      (C == '-' || C == '~'  || C == '_'))
++
++#define HI4(C) (C>>4)
++#define LO4(C) (C & 0x0F)
++
++
++#define hexint(C) (C < 10?('0' + C):('A'+ C - 10))
++
++char* amqp_util_encode(const str* key, char* dest)
++{
++	if ( (key->len == 1) && (key->s[0] == '#' || key->s[0] == '*') ) {
++		*dest++ = key->s[0];
++		return dest;
++	}
++	char* p, *end;
++	for (p = key->s, end = key->s + key->len; p < end; p++) {
++		if (KEY_SAFE(*p)) {
++			*dest++= *p;
++		} else if (*p == '.' ) {
++			memcpy(dest, "\%2E", 3);
++			dest+= 3;
++		} else if (*p == ' ') {
++			*dest++ = '+';
++		} else {
++			*dest++='%';
++			sprintf(dest, "%c%c", hexint(HI4(*p)), hexint(LO4(*p)));
++			dest+=2;
++		}
++	}
++	return dest;
++}
++
++#if 0
++encode(<<"*">>) -> <<"*">>;
++encode(<<"#">>) -> <<"#">>;
++encode(Bin) -> << <<(encode_char(B))/binary>> || <<B>> <= Bin >>.
++
++-define(HI4(C), (C band 2#11110000) bsr 4).
++-define(LO4(C), (C band 2#00001111)).
++
++encode_char(C) when ?KEY_SAFE(C) -> <<C>>;
++encode_char($\s) -> <<$+>>;
++encode_char($.) -> <<$%, $2, $E>>;
++encode_char(C) ->
++    Hi4 = ?HI4(C),
++    Lo4 = ?LO4(C),
++    <<$%, (hexint(Hi4)), (hexint(Lo4))>>.
++
++}
++#endif
++
++#define AUTH_ROUTING_KEY_PREFIX "authn.req."
++#define AUTH_ROUTING_KEY_PREFIX_LEN sizeof("authn.req.") - 1
++
++#define REG_ROUTING_KEY_PREFIX "registration.success."
++#define REG_ROUTING_KEY_PREFIX_LEN sizeof("registration.success.") - 1
++
++static unsigned long rpl_routing_key_count = 0;
++
++db1_res_t* dbk_creds_build_result(char* body, const db_key_t* _c, int _nc) {
++	struct json_object *json_obj;	
++	struct json_object *init_json_obj = NULL;	
++	db1_res_t* db_res = 0;
++	str password;
++	int col;
++
++	db_res = db_new_result();
++	if (!db_res) {
++		LM_ERR("no memory left\n");
++		return NULL;
++	}
++	RES_ROW_N(db_res) = 0;
++
++	json_obj = json_tokener_parse(body);
++	if (is_error(json_obj)) {
++		LM_ERR("Error parsing json: %s\n",
++		       json_tokener_errors[-(unsigned long)json_obj]);
++		goto error;
++	}
++	init_json_obj = json_obj;
++
++	struct json_object* password_obj = json_object_object_get(json_obj, "Auth-Password");
++	if (is_error(json_obj)) {
++		LM_ERR("Error parsing json: %s\n",
++		       json_tokener_errors[-(unsigned long)json_obj]);
++		goto error;
++	}
++	password.s = (char*)json_object_get_string(password_obj);
++	if (password.s == NULL) {
++		LM_ERR("Json-c error - failed to extract password [%s]\n", body);
++		goto error;
++	}
++	password.len = strlen(password.s);
++	LM_INFO("Password: [%s]\n", password.s);
++
++	RES_COL_N(db_res) = _nc;
++	RES_ROW_N(db_res) = 1;
++	if (db_allocate_rows(db_res) < 0) {
++		LM_ERR("Could not allocate rows.\n");
++		goto error; 
++	}
++
++	if (db_allocate_columns(db_res, RES_COL_N(db_res)) != 0) {
++		LM_ERR("Could not allocate columns\n");
++		goto error;
++	}
++	if (db_allocate_row(db_res, &(RES_ROWS(db_res)[0])) != 0) {
++		LM_ERR("Could not allocate row.\n");
++		goto error; 
++	}
++
++	for(col = 0; col < RES_COL_N(db_res); col++) {
++		RES_NAMES(db_res)[col] = (str*)pkg_malloc(sizeof(str));
++		if (! RES_NAMES(db_res)[col]) {
++			LM_ERR("no private memory left\n");
++			RES_COL_N(db_res) = col;
++			db_free_columns(db_res);
++			goto error;
++		}
++		LM_DBG("Allocated %lu bytes for RES_NAMES[%d] at %p\n",
++			(unsigned long)sizeof(str), col, RES_NAMES(db_res)[col]);
++
++		RES_NAMES(db_res)[col]->s = _c[col]->s;
++		RES_NAMES(db_res)[col]->len = _c[col]->len;
++		RES_TYPES(db_res)[col] = DB1_STR;
++
++		LM_DBG("RES_NAMES(%p)[%d]=[%.*s]\n", RES_NAMES(db_res)[col], col,
++			RES_NAMES(db_res)[col]->len, RES_NAMES(db_res)[col]->s);
++	}
++
++
++	/* complete the row with the columns */
++	for(col = 0; col< _nc; col++) {
++		LM_INFO("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
++		RES_ROWS(db_res)[0].values[col].type = DB1_STR;
++		if (strncmp(_c[col]->s, "password", _c[col]->len) == 0 ) {
++			LM_INFO("Wrote the password in the result\n");
++				
++			RES_ROWS(db_res)[0].values[col].val.str_val.s = (char*)pkg_malloc(password.len+1);
++			if (RES_ROWS(db_res)[0].values[col].val.str_val.s==NULL) {
++				PKG_MEM_ERROR;
++				goto error;
++			}
++			strcpy(RES_ROWS(db_res)[0].values[col].val.str_val.s, password.s);
++			RES_ROWS(db_res)[0].values[col].val.str_val.len = password.len;
++
++			RES_ROWS(db_res)[0].values[col].free  = 1;
++			RES_ROWS(db_res)[0].values[col].nul  = 0;
++			LM_INFO("Password in result: [%s]\n", RES_ROWS(db_res)[0].values[col].val.string_val);
++		} else {
++			RES_ROWS(db_res)[0].values[col].val.str_val.s = "";
++			RES_ROWS(db_res)[0].values[col].val.str_val.len = 0;
++			RES_ROWS(db_res)[0].values[col].free  = 0;
++			RES_ROWS(db_res)[0].values[col].nul  = 1;
++		} 
++	}
++//	RES_ROW_N(db_res) = 1;
++
++	/* decrement the reference of the object*/
++	json_object_put(init_json_obj);
++
++	return db_res;
++
++error:
++	if(init_json_obj)
++		json_object_put(init_json_obj);
++	return db_res;
++	
++}	
++
++
++int dbk_credentials_query(const db1_con_t* _h, const db_key_t* _k,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc, db1_res_t** _r)
++{
++	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
++	char routingkey[128];
++	char messagebody[1024];
++	amqp_bytes_t amqp_rk;
++	amqp_bytes_t amqp_mb;
++	char serverid[128];
++	amqp_bytes_t rpl_queue= {0, 0};
++	
++	LM_INFO("RMQ struct %p\n", rconn);
++
++	/* routingkey = authn.req._auth_realm_ */
++	amqp_rk.bytes = routingkey;
++	memcpy(routingkey, AUTH_ROUTING_KEY_PREFIX, AUTH_ROUTING_KEY_PREFIX_LEN);
++	amqp_rk.len = amqp_util_encode(&_v[1].val.str_val, routingkey+AUTH_ROUTING_KEY_PREFIX_LEN) - routingkey;
++	if (amqp_rk.len < AUTH_ROUTING_KEY_PREFIX_LEN + _v[1].val.str_val.len) {
++		LM_ERR("Encoding didn't succeed %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++		return -1;
++	}
++
++	/* construct messagebody */
++
++//	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
++	sprintf(serverid, "kamailio@%.*s-<%d>-%lu", _v[1].val.str_val.len, _v[1].val.str_val.s, my_pid(), rpl_routing_key_count++);
++
++	amqp_mb.len = sprintf(messagebody, "{\"Orig-IP\":\"109.103.86.242\","
++						"\"Method\":\"REGISTER\","
++						"\"Auth-Realm\":\"%.*s\","
++						"\"Auth-User\":\"%.*s\","
++						"\"From\":\"%.*s@%.*s\","
++						"\"To\":\"%.*s@%.*s\","
++						"\"Server-ID\":\"%s\","
++						"\"Node\":\"kamailio@kazoo2.anca-kazoo.com\","
++						"\"Msg-ID\":\"%s\","
++						"\"App-Version\":\"%s\","
++						"\"App-Name\":\"%s\","
++						"\"Event-Name\":\"authn_req\","
++						"\"Event-Category\":\"directory\"}",
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						_v[0].val.str_val.len, _v[0].val.str_val.s,
++						_v[1].val.str_val.len, _v[1].val.str_val.s,
++						serverid,serverid,
++						VERSION, NAME);
++	amqp_mb.bytes = messagebody;
++
++	LM_INFO("AMQP: exchange %.*s\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_INFO("AMQP: body: %s\n", messagebody);
++	
++	/* Declare reply queue and start consumer */
++	amqp_bytes_t rpl_routing_key= {strlen(serverid), serverid};
++
++	LM_INFO("AMQP: before queue_declare rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	amqp_queue_declare_ok_t *r = amqp_queue_declare(rconn->conn, rconn->channel, amqp_empty_bytes, 0, 0, 1, 1,
++								 amqp_empty_table);
++	if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++    	rpl_queue = amqp_bytes_malloc_dup(r->queue);
++    	if (rpl_queue.bytes == NULL) {
++      		LM_ERR("Out of memory while copying queue name\n");
++      		goto error;
++	}
++
++	amqp_bytes_t rpl_exch = {8, "targeted"};
++	amqp_queue_bind(rconn->conn, rconn->channel, rpl_queue, rpl_exch, rpl_routing_key, amqp_empty_table);
++	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++	LM_INFO("AMQP: after queue_bind  rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	LM_INFO("AMQP: after queue_bind  server_id: [%s]\n", serverid);
++		/*
++	publish
++	*/
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			rconn->exchange,
++			amqp_rk,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++
++	amqp_basic_consume(rconn->conn, rconn->channel, rpl_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
++	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
++		goto error;
++	}
++
++	amqp_frame_t frame;
++	int result;
++
++	amqp_basic_deliver_t *d;
++	amqp_basic_properties_t *p;
++	size_t body_target;
++	size_t body_received = 0;
++	char body[2048];
++
++	while (1) {
++		LM_INFO("Before amqp_maybe_release_buffers\n");
++		amqp_maybe_release_buffers(rconn->conn);
++		LM_INFO("After amqp_maybe_release_buffers\n");
++		result = amqp_simple_wait_frame(rconn->conn, &frame);
++		LM_INFO("Result: %d\n", result);
++		if (result < 0) {
++			break;
++		}
++
++		LM_INFO("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
++		if (frame.frame_type != AMQP_FRAME_METHOD) {
++			continue;
++		}
++
++		LM_INFO("Method: %s\n", amqp_method_name(frame.payload.method.id));
++		if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) {
++			continue;
++		}
++
++		d = (amqp_basic_deliver_t *) frame.payload.method.decoded;
++		LM_INFO("Delivery: %u exchange: %.*s routingkey: %.*s\n",
++				(unsigned) d->delivery_tag,
++				(int) d->exchange.len, (char *) d->exchange.bytes,
++				(int) d->routing_key.len, (char *) d->routing_key.bytes);
++
++		result = amqp_simple_wait_frame(rconn->conn, &frame);
++		if (result < 0) {
++			break;
++		}
++
++		if (frame.frame_type != AMQP_FRAME_HEADER) {
++			LM_ERR("amqp: Expected header!");
++			goto error;
++		}
++		p = (amqp_basic_properties_t *) frame.payload.properties.decoded;
++		if (p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG) {
++			LM_INFO("Content-type: %.*s\n",
++			(int) p->content_type.len, (char *) p->content_type.bytes);
++		}
++		LM_INFO("----\n");
++
++		body_target = frame.payload.properties.body_size;
++		body_received = 0;
++
++		while (body_received < body_target) {
++			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			if (result < 0) {
++				break;
++			}
++
++			if (frame.frame_type != AMQP_FRAME_BODY) {
++				LM_ERR("amqp: Expected header!");
++				goto error;
++			}
++
++			memcpy(body + body_received, frame.payload.body_fragment.bytes,
++					frame.payload.body_fragment.len);
++
++			body_received += frame.payload.body_fragment.len;
++
++			LM_INFO("%.*s\n", (int)frame.payload.body_fragment.len,
++					(char*)frame.payload.body_fragment.bytes);
++		}
++
++		if (body_received > body_target) {
++			LM_CRIT("Received more than expected: recv %zu, expected %zu\n",
++					body_received, body_target);
++			goto error;
++		}
++
++		if (body_received != body_target) {
++			/* Can only happen when amqp_simple_wait_frame returns <= 0 */
++			/* We break here to close the connection */
++			break;
++		}
++
++		/* everything was fine, we can quit now because we received the reply */
++		break;
++	}
++
++	body[body_received] = '\0';
++	LM_INFO("Received reply %s\n", body);
++
++	amqp_queue_purge(rconn->conn, rconn->channel, rpl_queue);
++	if (rmq_error("Purging reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to purge reply queue\n");
++	}
++	
++	LM_INFO("rpl_queue [%.*s], rpl_exchange [%.*s], rpl_routing_key [%.*s]\n",
++		 (int)rpl_queue.len, (char*)rpl_queue.bytes, 
++		 (int)rpl_exch.len, (char*)rpl_exch.bytes, 
++		 (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes 
++		);
++	amqp_queue_unbind(rconn->conn, rconn->channel, rpl_queue, rpl_exch,  rpl_routing_key, amqp_empty_table);	
++	if (rmq_error("Unbinding reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to unbind queue\n");
++	}
++	amqp_queue_delete(rconn->conn, rconn->channel, rpl_queue, 0, 0);
++	if (rmq_error("Deleting reply queue", amqp_get_rpc_reply(rconn->conn))) {
++		LM_ERR("Failed to delete queue\n");
++	}
++	LM_INFO("rpl_queue [%.*s]\n", (int)rpl_queue.len, (char*)rpl_queue.bytes);
++
++	/* parse json and extract password */
++	db1_res_t* db_res = dbk_creds_build_result(body, _c, _nc);	
++	*_r = db_res;
++	amqp_bytes_free(rpl_queue);
++	return 0;
++error:
++	if(rpl_queue.bytes)
++		amqp_bytes_free(rpl_queue);
++	return -1;
++}
++
++db1_res_t* db_empty_result(void)
++{
++	db1_res_t* db_res = db_new_result();
++	if (!db_res) {
++		LM_ERR("no memory left\n");
++		return NULL;
++	}
++	RES_ROW_N(db_res) = 0;
++	return db_res;
++}
++
++/*
++ * Query table for specified rows
++ * _h: structure representing database connection
++ * _k: key names
++ * _op: operators
++ * _v: values of the keys that must match
++ * _c: column names to return
++ * _n: number of key=values pairs to compare
++ * _nc: number of columns to return
++ * _o: order by the specified column
++ */
++int db_kazoo_query(const db1_con_t* _h, const db_key_t* _k, const db_op_t* _op,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc,
++		const db_key_t _o, db1_res_t** _r)
++{
++	if (!_h || !CON_TABLE(_h) || !_r) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("query table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "subscriber", 10)== 0 ) {
++		return dbk_credentials_query(_h, _k, _v, _c, _n, _nc, _r);
++	} else if(strncmp(_h->table->s, "presentity", 10)== 0 ) {
++		return dbk_presence_query(_h, _k, _v, _c, _n, _nc, _r);
++	} else {
++		LM_INFO("Not supported\n");
++		*_r = db_empty_result();
++		return 0;
++	}
++}
++
++int amqp_register_notice(const db1_con_t* _h, const db_key_t* _k,
++                            	const db_val_t* _v, const int _n) {
++
++	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
++	char routingkey[128];
++	char messagebody[1024];
++	amqp_bytes_t amqp_rk;
++	amqp_bytes_t amqp_mb;
++	int col;
++
++	/* construct messagebody */
++
++	str user= {0,0};
++	str contact = {0, 0};
++	int expires = 0;
++	
++	str callid = {0, 0};
++	str user_agent = {0, 0};
++	str network_ip = {0, 0};
++	str network_port = {0, 0};
++	str network_proto = {0, 0};
++	str host = {0, 0};
++	str received = {0, 0};
++
++	for (col = 0; col < _n; col ++) {
++		if (!user.len && strncmp(_k[col]->s, "username", 8) == 0) {
++			user = _v[col].val.str_val;
++		} else if (!contact.len && strncmp(_k[col]->s, "contact", 7) == 0) {
++			contact = _v[col].val.str_val;
++		} else if (!expires && strncmp(_k[col]->s, "expires", 7) == 0) {
++			expires= _v[col].val.int_val - (int)time(NULL);
++		} else if (!callid.len && strncmp(_k[col]->s, "callid", 6) == 0) {
++			callid = _v[col].val.str_val;
++		} else if (!user_agent.len && strncmp(_k[col]->s, "user_agent", 10) == 0) {
++			user_agent = _v[col].val.str_val;
++		} else if (!host.len && strncmp(_k[col]->s, "domain", 6) == 0) {
++			host = _v[col].val.str_val;
++		} else if (!network_ip.len && strncmp(_k[col]->s, "socket", 6) == 0) {
++	
++			char* dp = memchr( _v[col].val.str_val.s, ':',  _v[col].val.str_val.len);
++			if (dp == NULL) {
++				LM_ERR("Wrong formated socket uri %.*s\n",
++					  _v[col].val.str_val.len, _v[col].val.str_val.s);
++				goto error;
++			}		
++			network_proto.s = _v[col].val.str_val.s;	
++			network_proto.len = dp - network_proto.s;	
++		
++			dp++;
++			network_ip.s = dp;	
++			dp = memchr(dp, ':',  _v[col].val.str_val.len- network_proto.len -1);
++			if (dp == NULL) {
++				LM_ERR("Wrong formated socket uri %.*s\n",
++					  _v[col].val.str_val.len, _v[col].val.str_val.s);
++				goto error;
++			}		
++			network_ip.len = dp - network_ip.s;
++
++			network_port.s = dp + 1;
++			network_port.len = _v[col].val.str_val.s + _v[col].val.str_val.len - network_port.s;
++		} else if (!received.len && strncmp(_k[col]->s, "received", 8) == 0) {
++			received = _v[col].val.str_val;
++		}
++	}
++
++	LM_INFO("received = [%.*s]\n", received.len, received.s);
++
++	struct timeval current_time;
++	gettimeofday(&current_time, NULL);
++
++/*
++ * {"Network-Port":"5065","Network-IP":"178.79.172.28","FreeSWITCH-Nodename":"freeswitch@kazoo2.anca-kazoo.com","FreeSWITCH-Hostname":"kazoo2.anca-kazoo.com","RPid":"unknown","To-Host":"sip.anca-kazoo.com","To-User":"twinkle","From-Host":"sip.anca-kazoo.com","From-User":"twinkle","Presence-Hosts":"n/a","Profile-Name":"sipinterface_1","Call-ID":"msbmplhjhlbrtrg@anca-vaio","User-Agent":"Twinkle/1.4.2","Status":"Registered(UDP)","Realm":"sip.anca-kazoo.com","Username":"twinkle","Expires":"3600","Contact":"\"anca\" <sip:twinkle@109.103.86.242:62038;fs_path=<sip:178.79.172.28:5065;lr;received='sip:109.103.86.242:62038'>>","Event-Timestamp":63534134448,"Server-ID":"","Node":"ecallmgr@kazoo2.anca-kazoo.com","Msg-ID":"75535250c50683a1056811c0931c4915","App-Version":"0.8.0","App-Name":"ecallmgr","Event-Name":"reg_success","Event-Category":"directory"}
++ *
++ *
++ *
++ *
++ *
++   {"Network-Port":"5065","Network-IP":"178.79.172.28","FreeSWITCH-Nodename":"kamailio@kazoo2.anca-kazoo.com","FreeSWITCH-Hostname":"kazoo2.anca-kazoo.com","RPid":"unknown","To-Host":"sip.anca-kazoo.com","To-User":"twinkle","From-Host":"sip.anca-kazoo.com","From-User":"twinkle","Presence-Hosts":"n/a","Profile-Name":"sipinterface_1","Call-ID":"hmrtrtaowpxqvnh@anca-vaio","User-Agent":"Twinkle/1.4.2","Status":"Registered(udp)","Realm":"sip.anca-kazoo.com","Username":"twinkle","Expires":"600","Contact":"sip:twinkle@89.136.245.233:62038;fs_path=sip:178.79.172.28:5065;lr;received='sip:89.136.245.233:62038'","Event-Timestamp":"63535391249","Server-ID":"","Node":"kamailio@kazoo2.anca-kazoo.com","Msg-ID":"75535250c50683a1056811c0931c4915","App-Version":"4.1.0-dev2","App-Name":"kamailio","Event-Name":"reg_success","Event-Category":"directory"
++
++ *
++ * *
++ */
++#define NODE_NAME "ecallmgr"
++	amqp_mb.len = sprintf(messagebody, "{\"Network-Port\":\"%.*s\","
++					"\"Network-IP\":\"%.*s\","
++					"\"Kamailio-Hostname\":\"_hostname_\","
++					"\"RPid\":\"unknown\","
++					"\"To-Host\":\"%.*s\","
++					"\"To-User\":\"%.*s\","
++					"\"From-Host\":\"%.*s\","
++					"\"From-User\":\"%.*s\","
++					"\"Presence-Hosts\":\"n/a\","
++					"\"Profile-Name\":\"sipinterface_1\","
++					"\"Call-ID\":\"%.*s\","
++					"\"User-Agent\":\"%.*s\","
++					"\"Status\":\"Registered(%.*s)\","
++					"\"Realm\":\"%.*s\","
++					"\"Username\":\"%.*s\","
++					"\"Expires\":\"%d\","
++					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s:%.*s;lr;received='%.*s'>>\","
++					"\"Event-Timestamp\":\"%ld\","
++					"\"Server-ID\":\"\","
++					"\"Node\":\"kamailio@kazoo2.anca-kazoo.com\","
++					"\"Msg-ID\":\"_rand_\","
++					"\"App-Version\":\"%s\","
++					"\"App-Name\":\"%s\","
++					"\"Event-Name\":\"reg_success\","
++					"\"Event-Category\":\"directory\"} ",
++					network_port.len, network_port.s,
++					network_ip.len, network_ip.s,
++					host.len, host.s,
++					user.len, user.s,
++					host.len, host.s,
++					user.len, user.s,
++					callid.len, callid.s,
++					user_agent.len, user_agent.s,
++					network_proto.len, network_proto.s,
++					host.len, host.s,
++					user.len, user.s,
++					expires,
++					user.len, user.s, user.len, user.s, received.len-4, received.s+4, network_ip.len, network_ip.s,
++					network_port.len, network_port.s, received.len, received.s,
++					62167219200 + (int)time(NULL),
++			//		VERSION, NAME );
++					"0.8.0", "ecallmgr");
++	amqp_mb.bytes = messagebody;
++
++//	LM_DBG("%s\n", messagebody);
++
++	/* routingkey = registration.success._host_._user_ (restration.success.sip%2Eanca-kazoo%2Ecom.twinkle)  */
++	amqp_rk.bytes = routingkey;
++	memcpy(routingkey, REG_ROUTING_KEY_PREFIX, REG_ROUTING_KEY_PREFIX_LEN);
++	amqp_rk.len = amqp_util_encode(&host, routingkey+REG_ROUTING_KEY_PREFIX_LEN) - routingkey;
++	routingkey[amqp_rk.len++]='.';
++	amqp_rk.len = amqp_util_encode(&user, routingkey+amqp_rk.len) - routingkey;
++	if (amqp_rk.len < REG_ROUTING_KEY_PREFIX_LEN + host.len + user.len) {
++		LM_ERR("Encoding didn't succeed %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++		return -1;
++	}
++
++	LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_INFO("AMQP: channel %d\n", rconn->channel);
++	LM_INFO("AMQP: routing key [%.*s]\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_INFO("AMQP: body: %s\n", messagebody);
++	
++	/*
++		publish
++	*/
++	amqp_basic_properties_t props;
++	memset(&props, 0, sizeof(amqp_basic_properties_t));
++	props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG;
++	props.content_type = amqp_cstring_bytes("application/json");
++
++	amqp_basic_publish(rconn->conn,
++			rconn->channel,
++			rconn->exchange,
++			amqp_rk,
++			0,
++			0,
++			&props,
++			amqp_mb);
++
++
++	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
++		LM_ERR("Failed to publish\n");
++		goto error;
++	}
++
++	LM_INFO("Published with success\n");
++	return 0;
++
++error:
++	return -1;
++}
++
++int db_kazoo_insert (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n)
++{
++	if (!_h || !CON_TABLE(_h) ) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("insert into table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "location", _h->table->len)  == 0) {
++		return amqp_register_notice(_h, _k, _v, _n);
++	} else if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
++		return dbk_presence_subscribe_new(_h, _k, _v, _n);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
++
++
++int db_kazoo_insert_update (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n)
++{
++	if (!_h || !CON_TABLE(_h) ) {
++		LM_ERR("invalid parameter value\n");
++		return -1;
++	}
++	LM_INFO("insert into table=%s\n", _h->table->s);
++	
++	if(strncmp(_h->table->s, "dialoginfo", _h->table->len)  == 0) {
++		LM_INFO("Insert update called for dialoginfo table\n");
++		return dbk_dialoginfo_update(_h, _k, _v, _n);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
++
++int db_kazoo_update (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un) {
++	if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
++		LM_INFO("Update called for active_watchers table\n");
++		return dbk_presence_subscribe_update(_h, _k, _v, _uk, _uv, _n, _un);
++	} else {
++		LM_INFO("Not supported\n");
++		return 0;
++	}
++}
+diff --git a/modules/db_kazoo/dbase.c.rej b/modules/db_kazoo/dbase.c.rej
+new file mode 100644
+index 0000000..409f0e7
+--- /dev/null
++++ b/modules/db_kazoo/dbase.c.rej
+@@ -0,0 +1,64 @@
++--- backup/db_kazoo_orig/dbase.c	2013-06-19 19:42:11.000000000 +0000
+++++ modules/db_kazoo/dbase.c	2013-06-21 11:20:05.000000000 +0000
++@@ -13,6 +13,8 @@
++ #include "../../dprint.h"
++ #include "../../mem/mem.h"
++ 
+++#include "dbase.h"
+++
++ typedef struct rmq_conn {
++ 	struct db_id* id;        /**< Connection identifier */
++ 	unsigned int ref;        /**< Reference count */
++@@ -278,6 +280,7 @@
++ 	LM_INFO("Password: [%s]\n", password.s);
++ 
++ 	RES_COL_N(db_res) = _nc;
+++	RES_ROW_N(db_res) = 1;
++ 	if (db_allocate_rows(db_res) < 0) {
++ 		LM_ERR("Could not allocate rows.\n");
++ 		goto error; 
++@@ -337,7 +340,6 @@
++ 			RES_ROWS(db_res)[0].values[col].nul  = 1;
++ 		} 
++ 	}
++-	RES_ROW_N(db_res) = 1;
++ 
++ 	/* decrement the reference of the object*/
++ 	json_object_put(init_json_obj);
++@@ -722,11 +741,11 @@
++  *
++  * *
++  */
++-#define NODE_NAME "ecallmgr"
+++	tmb.generate_callid(&unique_string);
+++	
++ 	amqp_mb.len = sprintf(messagebody, "{\"Network-Port\":\"%.*s\","
++ 					"\"Network-IP\":\"%.*s\","
++-					"\"FreeSWITCH-Nodename\":\"freeswitch@kazoo2.anca-kazoo.com\","
++-					"\"FreeSWITCH-Hostname\":\"kazoo2.anca-kazoo.com\","
+++					"\"Kamailio-Hostname\":\"%.*s\","
++ 					"\"RPid\":\"unknown\","
++ 					"\"To-Host\":\"%.*s\","
++ 					"\"To-User\":\"%.*s\","
++@@ -740,17 +759,18 @@
++ 					"\"Realm\":\"%.*s\","
++ 					"\"Username\":\"%.*s\","
++ 					"\"Expires\":\"%d\","
++-					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s:%.*s;lr;received='%.*s'>>\","
+++					"\"Contact\":\"\\\"%.*s\\\" <sip:%.*s@%.*s;fs_path=<sip:%.*s;lr;received='%.*s'>>\","
++ 					"\"Event-Timestamp\":\"%ld\","
++ 					"\"Server-ID\":\"\","
++-					"\"Node\":\"ecallmgr@kazoo2.anca-kazoo.com\","
++-					"\"Msg-ID\":\"75535250c50683a1056811c0931c4915\","
+++					"\"Node\":\"kamailio@%.*s\","
+++					"\"Msg-ID\":\"%.*s\","
++ 					"\"App-Version\":\"%s\","
++ 					"\"App-Name\":\"%s\","
++ 					"\"Event-Name\":\"reg_success\","
++ 					"\"Event-Category\":\"directory\"} ",
++ 					network_port.len, network_port.s,
++ 					network_ip.len, network_ip.s,
+++					dbk_node_hostname.len, dbk_node_hostname.s,
++ 					host.len, host.s,
++ 					user.len, user.s,
++ 					host.len, host.s,
+diff --git a/modules/db_kazoo/dbase.h b/modules/db_kazoo/dbase.h
+new file mode 100644
+index 0000000..75f618e
+--- /dev/null
++++ b/modules/db_kazoo/dbase.h
+@@ -0,0 +1,90 @@
++#ifndef _DB_KAZOO_DBASE_
++#define _DB_KAZOO_DBASE_
++
++#include <amqp.h>
++#include "../../lib/srdb1/db.h"
++#include "../../lib/srdb1/db_id.h"
++#include "../../lib/srdb1/db_pool.h"
++#include "../tm/tm_load.h"
++
++extern str dbk_node_hostname;
++extern str dbk_reg_fs_path;
++extern struct tm_binds tmb;
++
++typedef struct rmq_conn {
++	struct db_id* id;        /**< Connection identifier */
++	unsigned int ref;        /**< Reference count */
++	struct pool_con* next;   /**< Next element in the pool */
++
++	amqp_connection_state_t conn;
++	amqp_socket_t *socket;
++	int channel;
++	amqp_bytes_t exchange;
++	amqp_basic_properties_t props;
++}rmq_conn_t;
++
++void* rmqp_new_connection(struct db_id* id);
++
++/* function that checks for error */
++static inline int rmq_error(char const *context, amqp_rpc_reply_t x)
++{
++	amqp_connection_close_t *mconn;
++	amqp_channel_close_t *mchan;
++
++	switch (x.reply_type) {
++		case AMQP_RESPONSE_NORMAL:
++			return 0;
++
++		case AMQP_RESPONSE_NONE:
++			LM_ERR("%s: missing RPC reply type!", context);
++			break;
++
++		case AMQP_RESPONSE_LIBRARY_EXCEPTION:
++			LM_ERR("%s: %s\n", context,  "(end-of-stream)");
++			break;
++
++		case AMQP_RESPONSE_SERVER_EXCEPTION:
++			switch (x.reply.id) {
++				case AMQP_CONNECTION_CLOSE_METHOD:
++					mconn = (amqp_connection_close_t *)x.reply.decoded;
++					LM_ERR("%s: server connection error %d, message: %.*s",
++							context, mconn->reply_code,
++							(int)mconn->reply_text.len,
++							(char *)mconn->reply_text.bytes);
++					break;
++				case AMQP_CHANNEL_CLOSE_METHOD:
++						mchan = (amqp_channel_close_t *)x.reply.decoded;
++					LM_ERR("%s: server channel error %d, message: %.*s",
++							context, mchan->reply_code,
++							(int)mchan->reply_text.len,
++							(char *)mchan->reply_text.bytes);
++					break;
++				default:
++					LM_ERR("%s: unknown server error, method id 0x%08X",
++							context, x.reply.id);
++					break;
++			}
++			break;
++	}
++	return -1;
++}
++
++
++void* db_kazoo_new_connection(struct db_id* id);
++
++int db_kazoo_query(const db1_con_t* _h, const db_key_t* _k, const db_op_t* _op,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc,
++		const db_key_t _o, db1_res_t** _r);
++
++int db_kazoo_insert (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n);
++
++void db_kazoo_free_connection(struct pool_con* con);
++
++int db_kazoo_insert_update (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n);
++
++int db_kazoo_update (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un);
++#endif
+diff --git a/modules/db_kazoo/dbase.h.orig b/modules/db_kazoo/dbase.h.orig
+new file mode 100644
+index 0000000..5f19074
+--- /dev/null
++++ b/modules/db_kazoo/dbase.h.orig
+@@ -0,0 +1,85 @@
++#ifndef _DB_KAZOO_DBASE_
++#define _DB_KAZOO_DBASE_
++
++#include <amqp.h>
++#include "../../lib/srdb1/db.h"
++#include "../../lib/srdb1/db_id.h"
++#include "../../lib/srdb1/db_pool.h"
++
++typedef struct rmq_conn {
++	struct db_id* id;        /**< Connection identifier */
++	unsigned int ref;        /**< Reference count */
++	struct pool_con* next;   /**< Next element in the pool */
++
++	amqp_connection_state_t conn;
++	amqp_socket_t *socket;
++	int channel;
++	amqp_bytes_t exchange;
++	amqp_basic_properties_t props;
++}rmq_conn_t;
++
++void* rmqp_new_connection(struct db_id* id);
++
++/* function that checks for error */
++static inline int rmq_error(char const *context, amqp_rpc_reply_t x)
++{
++	amqp_connection_close_t *mconn;
++	amqp_channel_close_t *mchan;
++
++	switch (x.reply_type) {
++		case AMQP_RESPONSE_NORMAL:
++			return 0;
++
++		case AMQP_RESPONSE_NONE:
++			LM_ERR("%s: missing RPC reply type!", context);
++			break;
++
++		case AMQP_RESPONSE_LIBRARY_EXCEPTION:
++			LM_ERR("%s: %s\n", context,  "(end-of-stream)");
++			break;
++
++		case AMQP_RESPONSE_SERVER_EXCEPTION:
++			switch (x.reply.id) {
++				case AMQP_CONNECTION_CLOSE_METHOD:
++					mconn = (amqp_connection_close_t *)x.reply.decoded;
++					LM_ERR("%s: server connection error %d, message: %.*s",
++							context, mconn->reply_code,
++							(int)mconn->reply_text.len,
++							(char *)mconn->reply_text.bytes);
++					break;
++				case AMQP_CHANNEL_CLOSE_METHOD:
++						mchan = (amqp_channel_close_t *)x.reply.decoded;
++					LM_ERR("%s: server channel error %d, message: %.*s",
++							context, mchan->reply_code,
++							(int)mchan->reply_text.len,
++							(char *)mchan->reply_text.bytes);
++					break;
++				default:
++					LM_ERR("%s: unknown server error, method id 0x%08X",
++							context, x.reply.id);
++					break;
++			}
++			break;
++	}
++	return -1;
++}
++
++
++void* db_kazoo_new_connection(struct db_id* id);
++
++int db_kazoo_query(const db1_con_t* _h, const db_key_t* _k, const db_op_t* _op,
++		const db_val_t* _v, const db_key_t* _c, int _n, int _nc,
++		const db_key_t _o, db1_res_t** _r);
++
++int db_kazoo_insert (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n);
++
++void db_kazoo_free_connection(struct pool_con* con);
++
++int db_kazoo_insert_update (const db1_con_t* _h, const db_key_t* _k,
++				const db_val_t* _v, const int _n);
++
++int db_kazoo_update (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
++				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
++				const int _n, const int _un);
++#endif
+diff --git a/modules/db_kazoo/tmp b/modules/db_kazoo/tmp
+new file mode 100644
+index 0000000..876a7b1
+--- /dev/null
++++ b/modules/db_kazoo/tmp
+@@ -0,0 +1,39 @@
++
++typedef struct {
++	str update;
++	pres_queue_t* next;	
++} pres_update_t;
++
++typedef struct {
++	lock_t lock;
++	pres_update_t* list;
++} pres_queue_t;
++
++
++pres_queue_t* pres_queue;
++
++int presence_push_queue(str* bu)
++{
++	pres_update_t* pu = NULL;
++
++	pu = (pres_update_t*)shm_malloc(sizeof(pres_update_t) + bu.len);
++	if ( pu == NULL ) {
++		LM_ERR("No more memory\n");
++		return -1;
++	}
++	pu->update.s = (char*)pu + sizeof(pres_update_t);
++	memcpy(pu->update.s, bu.s, bu.len);
++	pu->update.len = bu.len;
++	
++	lock_get(&pres_queue->lock);
++	pu->next = pres_queue->list;
++	pres_queue->list = pu;
++	lock_release(&pres_queue->lock);
++
++	return 0;
++
++}
++
++static int presence_initialized = 0;
++
++
