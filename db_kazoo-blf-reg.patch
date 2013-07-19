@@ -2781,11 +2781,11 @@ index 2392a81..6e518e4 100644
 --- a/modules/presence/bind_presence.c
 +++ b/modules/presence/bind_presence.c
 @@ -72,7 +72,9 @@ int bind_presence(presence_api_t* api)
-  api->handle_publish= handle_publish;
-  api->handle_subscribe0= handle_subscribe0;
-  api->handle_subscribe= handle_subscribe;
+ 	api->handle_publish= handle_publish;
+ 	api->handle_subscribe0= handle_subscribe0;
+ 	api->handle_subscribe= handle_subscribe;
 +	api->notify_watchers = pres_notify_watchers;
-  return 0;
+ 	return 0;
 +
  }
  
@@ -2801,12 +2801,12 @@ index a24ac19..f7ef155 100644
 +typedef int (*pres_notify_watchers_t)(str* user_uri, str* event, str* body);
 +
  typedef struct presence_api {
-  add_event_t add_event;
-  contains_event_t contains_event;
+ 	add_event_t add_event;
+ 	contains_event_t contains_event;
 @@ -71,6 +73,7 @@ typedef struct presence_api {
-  pres_handle_publish_t handle_publish;
-  pres_handle_subscribe0_t handle_subscribe0;
-  pres_handle_subscribe_t handle_subscribe;
+ 	pres_handle_publish_t handle_publish;
+ 	pres_handle_subscribe0_t handle_subscribe0;
+ 	pres_handle_subscribe_t handle_subscribe;
 +	pres_notify_watchers_t notify_watchers;
  } presence_api_t;
  
@@ -2816,8 +2816,8 @@ index d06fa6c..09e195c 100644
 --- a/modules/presence/notify.c
 +++ b/modules/presence/notify.c
 @@ -3011,3 +3011,85 @@ void pres_timer_send_notify(unsigned int ticks, void *param)
-	return;
-  }
+ 		return;
+ 	}
  }
 +
 +int pres_notify_watchers(str* pres_uri, str* event_str, str* body)
@@ -2918,60 +2918,60 @@ index ed7f4d1..ebefb4e 100644
 --- a/modules/presence/presence.c
 +++ b/modules/presence/presence.c
 @@ -311,6 +311,8 @@ static int mod_init(void)
-	return -1;
-  }
+ 		return -1;
+ 	}
  
 +	
 +	#if 0
-  /*verify table versions */
-  if((db_check_table_version(&pa_dbf, pa_db, &presentity_table, P_TABLE_VERSION) < 0) ||
-	(db_check_table_version(&pa_dbf, pa_db, &watchers_table, S_TABLE_VERSION) < 0)) {
+ 	/*verify table versions */
+ 	if((db_check_table_version(&pa_dbf, pa_db, &presentity_table, P_TABLE_VERSION) < 0) ||
+ 		(db_check_table_version(&pa_dbf, pa_db, &watchers_table, S_TABLE_VERSION) < 0)) {
 @@ -323,6 +325,7 @@ static int mod_init(void)
-	LM_ERR("wrong table version for %s\n", active_watchers_table.s);
-	return -1;
-  }
+ 		LM_ERR("wrong table version for %s\n", active_watchers_table.s);
+ 		return -1;
+ 	}
 +	#endif
  
-  if(subs_dbmode != DB_ONLY) {
-	if(shtable_size< 1)
+ 	if(subs_dbmode != DB_ONLY) {
+ 		if(shtable_size< 1)
 @@ -336,7 +339,7 @@ static int mod_init(void)
-	  LM_ERR(" initializing subscribe hash table\n");
-	  return -1;
-	}
+ 			LM_ERR(" initializing subscribe hash table\n");
+ 			return -1;
+ 		}
 -		if(restore_db_subs()< 0)
 +		if(subs_dbmode!=NO_DB && restore_db_subs()< 0)
-	{
-	  LM_ERR("restoring subscribe info from database\n");
-	  return -1;
+ 		{
+ 			LM_ERR("restoring subscribe info from database\n");
+ 			return -1;
 @@ -356,11 +359,13 @@ static int mod_init(void)
-	  return -1;
-	}
+ 			return -1;
+ 		}
  
 +#if 0
-	if(pres_htable_restore()< 0)
-	{
-	  LM_ERR("filling in presentity hash table from database\n");
-	  return -1;
-	}
+ 		if(pres_htable_restore()< 0)
+ 		{
+ 			LM_ERR("filling in presentity hash table from database\n");
+ 			return -1;
+ 		}
 +#endif
-  }
+ 	}
  
-  startup_time = (int) time(NULL);
+ 	startup_time = (int) time(NULL);
 @@ -392,10 +397,10 @@ static int mod_init(void)
  
-	register_basic_timers(pres_notifier_processes);
-  }
+ 		register_basic_timers(pres_notifier_processes);
+ 	}
 -
 +#if 0
-  pa_dbf.close(pa_db);
-  pa_db = NULL;
+ 	pa_dbf.close(pa_db);
+ 	pa_db = NULL;
 -
 +#endif
-  return 0;
+ 	return 0;
  }
  
 @@ -671,6 +676,7 @@ error:
-  return -1;
+ 	return -1;
  }
  
 +
@@ -2983,14 +2983,14 @@ index aff55f3..9946ca1 100644
 --- a/modules/presence/subscribe.c
 +++ b/modules/presence/subscribe.c
 @@ -460,6 +460,8 @@ void delete_subs(str* pres_uri, str* ev_name, str* to_tag,
-  if(subs_dbmode != DB_ONLY)
-  {
-	unsigned int hash_code= core_hash(pres_uri, ev_name, shtable_size);
+ 	if(subs_dbmode != DB_ONLY)
+ 	{
+ 		unsigned int hash_code= core_hash(pres_uri, ev_name, shtable_size);
 +		LM_INFO("Pres_uri=[%.*s], ev_name=[%.*s] to_tag=[%.*s]\n", pres_uri->len, pres_uri->s,
 +			 ev_name->len, ev_name->s, to_tag->len, to_tag->s);
-	if(delete_shtable(subs_htable, hash_code, *to_tag) < 0)
-	  LM_ERR("Failed to delete subscription from memory\n");
-  }
+ 		if(delete_shtable(subs_htable, hash_code, *to_tag) < 0)
+ 			LM_ERR("Failed to delete subscription from memory\n");
+ 	}
 diff --git a/modules/presence_dialoginfo/bind_pres_dialoginfo.h b/modules/presence_dialoginfo/bind_pres_dialoginfo.h
 new file mode 100644
 index 0000000..c9174fa
@@ -3039,22 +3039,22 @@ index cc65efb..1a57940 100644
  
  void free_xml_body(char* body)
 @@ -69,7 +69,7 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
-  if(body_array== NULL)
-	return NULL;
+ 	if(body_array== NULL)
+ 		return NULL;
  
 -	n_body= agregate_xmls(pres_user, pres_domain, body_array, n);
 +	n_body= agg_dialoginfo_xmls(pres_user, pres_domain, body_array, n);
-  LM_DBG("[n_body]=%p\n", n_body);
-  if(n_body) {
-	LM_DBG("[*n_body]=%.*s\n",
+ 	LM_DBG("[n_body]=%p\n", n_body);
+ 	if(n_body) {
+ 		LM_DBG("[*n_body]=%.*s\n",
 @@ -86,7 +86,7 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
-  return n_body;
+ 	return n_body;
  }	
  
 -str* agregate_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
 +str* agg_dialoginfo_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
  {
-  int i, j= 0;
+ 	int i, j= 0;
  
 diff --git a/modules/presence_dialoginfo/notify_body.h b/modules/presence_dialoginfo/notify_body.h
 index 838ddfe..ae0d597 100644
@@ -3110,19 +3110,19 @@ index 900e582..48f0534 100644
 --- a/modules/pua/pua.c
 +++ b/modules/pua/pua.c
 @@ -207,11 +207,11 @@ static int mod_init(void)
-	return -1;
-  }
-  /* verify table version  */
+ 		return -1;
+ 	}
+ 	/* verify table version  */
 -	if(db_check_table_version(&pua_dbf, pua_db, &db_table, PUA_TABLE_VERSION) < 0) {
 +/*	if(db_check_table_version(&pua_dbf, pua_db, &db_table, PUA_TABLE_VERSION) < 0) {
-	LM_ERR("error during table version check.\n");
-	return -1;
-  }
+ 		LM_ERR("error during table version check.\n");
+ 		return -1;
+ 	}
 -
 +*/
-  if (dbmode != PUA_DB_ONLY)
-  { 
-	if(HASH_SIZE<=1)
+ 	if (dbmode != PUA_DB_ONLY)
+ 	{ 
+ 		if(HASH_SIZE<=1)
 diff --git a/modules/pua_dialoginfo/Makefile b/modules/pua_dialoginfo/Makefile
 index f99f41f..fbb9f43 100644
 --- a/modules/pua_dialoginfo/Makefile
@@ -3177,15 +3177,15 @@ index 95b6cb3..843bd59 100644
 @@ -57,7 +57,7 @@ void print_publ(publ_info_t* p)
  
  str* build_dialoginfo(char *state, str *entity, str *peer, str *callid, 
-  unsigned int initiator, str *localtag, str *remotetag,
+ 	unsigned int initiator, str *localtag, str *remotetag,
 -	str *localtarget, str *remotetarget)
 +	str *localtarget, str *remotetarget, int version)
  {
-  xmlDocPtr  doc = NULL; 
-  xmlNodePtr root_node = NULL;
+ 	xmlDocPtr  doc = NULL; 
+ 	xmlNodePtr root_node = NULL;
 @@ -91,8 +91,11 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
-	  BAD_CAST "urn:ietf:params:xml:ns:dialog-info");
-  /* we set the version to 0 but it should be set to the correct value
+ 			BAD_CAST "urn:ietf:params:xml:ns:dialog-info");
+ 	/* we set the version to 0 but it should be set to the correct value
         in the pua module */
 -	xmlNewProp(root_node, BAD_CAST "version",
 -			BAD_CAST "0");
@@ -3194,11 +3194,11 @@ index 95b6cb3..843bd59 100644
 +//	char* p = int2str(version, 0);
 +//	xmlNewProp(root_node, BAD_CAST "version",
 +//			BAD_CAST p);
-  xmlNewProp(root_node, BAD_CAST  "state",
-	  BAD_CAST "full" );
-  xmlNewProp(root_node, BAD_CAST "entity", 
+ 	xmlNewProp(root_node, BAD_CAST  "state",
+ 			BAD_CAST "full" );
+ 	xmlNewProp(root_node, BAD_CAST "entity", 
 @@ -260,6 +263,76 @@ error:
-  return NULL;
+ 	return NULL;
  }	
  
 +/* {"From-User": "uri", "To-User": "uri", "New-State": "state", "Call-ID": "callid", 
@@ -3272,28 +3272,28 @@ index 95b6cb3..843bd59 100644
 +}
 +
  void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
-  unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
-  str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck)
+ 	unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
+ 	str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck)
 @@ -290,7 +363,7 @@ void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
-  content_type.s= "application/dialog-info+xml";
-  content_type.len= 27;
+ 	content_type.s= "application/dialog-info+xml";
+ 	content_type.len= 27;
  
 -	body= build_dialoginfo(state, entity, peer, callid, initiator, localtag, remotetag, localtarget, remotetarget);
 +	body= build_dialoginfo(state, entity, peer, callid, initiator, localtag, remotetag, localtarget, remotetarget, 0);
-  if(body == NULL || body->s == NULL)
-	goto error;
-  
+ 	if(body == NULL || body->s == NULL)
+ 		goto error;
+ 	
 @@ -377,14 +450,18 @@ error:
  }
  
  
 -
  void dialog_publish_multi(char *state, struct str_list* ruris, str *entity, str *peer, str *callid,
-  unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
-  str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck) {
+ 	unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
+ 	str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck) {
  
-  while(ruris) {
-	LM_INFO("CALLING dialog_publish for URI %.*s\n",ruris->s.len, ruris->s.s);
+ 	while(ruris) {
+ 		LM_INFO("CALLING dialog_publish for URI %.*s\n",ruris->s.len, ruris->s.s);
 -		dialog_publish(state,&(ruris->s),entity,peer,callid,initiator,lifetime,localtag,remotetag,localtarget,remotetarget,do_pubruri_localcheck);
 +		if ( pua_dialoginfo_db ) {
 +			if (initiator)
@@ -3301,8 +3301,8 @@ index 95b6cb3..843bd59 100644
 +		} else {
 +			dialog_publish(state,&(ruris->s),entity,peer,callid,initiator,lifetime,localtag,remotetag,localtarget,remotetarget,do_pubruri_localcheck);
 +		}
-	ruris=ruris->next;
-  }
+ 		ruris=ruris->next;
+ 	}
  
 diff --git a/modules/pua_dialoginfo/pua_dialoginfo.c b/modules/pua_dialoginfo/pua_dialoginfo.c
 index 9c842b0..e51ce70 100644
@@ -3343,46 +3343,46 @@ index 9c842b0..e51ce70 100644
  static cmd_export_t cmds[]=
  {
 +	{"bind_pua_dialoginfo", (cmd_function)bind_pua_dialoginfo, 1, 0, 0, 0},
-  {0, 0, 0, 0, 0, 0} 
+ 	{0, 0, 0, 0, 0, 0} 
  };
  
 @@ -116,6 +125,8 @@ static param_export_t params[]={
-  {"use_pubruri_avps",    INT_PARAM, &use_pubruri_avps },
-  {"pubruri_caller_avp",  STR_PARAM, &pubruri_caller_avp },
-  {"pubruri_callee_avp",  STR_PARAM, &pubruri_callee_avp },
+ 	{"use_pubruri_avps",    INT_PARAM, &use_pubruri_avps },
+ 	{"pubruri_caller_avp",  STR_PARAM, &pubruri_caller_avp },
+ 	{"pubruri_callee_avp",  STR_PARAM, &pubruri_callee_avp },
 +	{"db_url",              STR_PARAM, &db_url.s},
 +	{"library_mode",        INT_PARAM, &library_mode},
-  {0, 0, 0 }
+ 	{0, 0, 0 }
  };
  
 @@ -130,8 +141,8 @@ struct module_exports exports= {
-  0,						/* extra processes */
-  mod_init,				/* module initialization function */
-  0,						/* response handling function */
+ 	0,						/* extra processes */
+ 	mod_init,				/* module initialization function */
+ 	0,						/* response handling function */
 -	0,						/* destroy function */
 -	NULL					/* per-child init function */
 +	mod_destroy,				/* destroy function */
 +	child_init				/* per-child init function */
  };
-  
+ 	
  
 @@ -479,10 +490,12 @@ __dialog_created(struct dlg_cell *dlg, int type, struct dlg_cb_params *_params)
  static int mod_init(void)
  {
-  bind_pua_t bind_pua;
+ 	bind_pua_t bind_pua;
 -
-  str s;
-  pv_spec_t avp_spec;
-  
+ 	str s;
+ 	pv_spec_t avp_spec;
+ 	
 +	if ( library_mode )
 +		return 0;
 +
-  bind_pua= (bind_pua_t)find_export("bind_pua", 1,0);
-  if (!bind_pua)
-  {
+ 	bind_pua= (bind_pua_t)find_export("bind_pua", 1,0);
+ 	if (!bind_pua)
+ 	{
 @@ -542,6 +555,15 @@ static int mod_init(void)
  
-  }
+ 	}
  
 +	db_url.len = db_url.s ? strlen(db_url.s) : 0;
 +	dialoginfo_db_table.len = dialoginfo_db_table.s ? strlen(dialoginfo_db_table.s) : 0;
@@ -3393,11 +3393,11 @@ index 9c842b0..e51ce70 100644
 +		return -1;
 +	}
 +
-  return 0;
+ 	return 0;
  }
  
 @@ -572,3 +594,51 @@ void free_str_list_all(struct str_list * del_current) {
-  }
+ 	}
  
  }
 +
@@ -3464,7 +3464,7 @@ index f6e43b6..c2d002a 100644
 +extern db_func_t pua_dialoginfo_dbf;
  
  void dialog_publish_multi(char *state, struct str_list* ruris, str *entity, str *peer, str *callid,
-  unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
+ 	unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
 @@ -53,4 +57,7 @@ struct dlginfo_cell {
  void free_dlginfo_cell(void *param);
  void free_str_list_all(struct str_list * del_current);
@@ -3478,53 +3478,52 @@ index 2f14f16..e4cc08e 100644
 --- a/modules/usrloc/dlist.c
 +++ b/modules/usrloc/dlist.c
 @@ -629,6 +629,7 @@ int register_udomain(const char* _n, udomain_t** _d)
-  /* Test tables from database if we are gonna
-   * to use database
-   */
+ 	/* Test tables from database if we are gonna
+ 	 * to use database
+ 	 */
 +#if 0
-  if (db_mode != NO_DB) {
-	con = ul_dbf.init(&db_url);
-	if (!con) {
+ 	if (db_mode != NO_DB) {
+ 		con = ul_dbf.init(&db_url);
+ 		if (!con) {
 @@ -648,7 +649,7 @@ int register_udomain(const char* _n, udomain_t** _d)
  
-	ul_dbf.close(con);
-  }
+ 		ul_dbf.close(con);
+ 	}
 -
 +#endif
-  d->next = root;
-  root = d;
-  
+ 	d->next = root;
+ 	root = d;
+ 	
 diff --git a/modules/usrloc/ul_mod.c b/modules/usrloc/ul_mod.c
 index 77a2a40..af1ecd1 100644
 --- a/modules/usrloc/ul_mod.c
 +++ b/modules/usrloc/ul_mod.c
 @@ -421,7 +421,8 @@ static int child_init(int _rank)
-	case WRITE_THROUGH:
-	  /* we need connection from working SIP and TIMER and MAIN
-	   * processes only */
+ 		case WRITE_THROUGH:
+ 			/* we need connection from working SIP and TIMER and MAIN
+ 			 * processes only */
 -			if (_rank<=0 && _rank!=PROC_TIMER && _rank!=PROC_MAIN)
 +//			if (_rank<=0 && _rank!=PROC_TIMER && _rank!=PROC_MAIN)
 +			if (_rank<=0 && _rank!=PROC_TIMER)
-		return 0;
-	  break;
-	case WRITE_BACK:
+ 				return 0;
+ 			break;
+ 		case WRITE_BACK:
 @@ -437,6 +438,7 @@ static int child_init(int _rank)
-	LM_ERR("child(%d): failed to connect to database\n", _rank);
-	return -1;
-  }
+ 		LM_ERR("child(%d): failed to connect to database\n", _rank);
+ 		return -1;
+ 	}
 +#if 0
-  /* _rank==PROC_SIPINIT is used even when fork is disabled */
-  if (_rank==PROC_SIPINIT && db_mode!= DB_ONLY) {
-	/* if cache is used, populate domains from DB */
+ 	/* _rank==PROC_SIPINIT is used even when fork is disabled */
+ 	if (_rank==PROC_SIPINIT && db_mode!= DB_ONLY) {
+ 		/* if cache is used, populate domains from DB */
 @@ -449,6 +451,7 @@ static int child_init(int _rank)
-	  uldb_preload_attrs(ptr->d);
-	}
-  }
+ 			uldb_preload_attrs(ptr->d);
+ 		}
+ 	}
 +#endif
  
-  return 0;
+ 	return 0;
  }
 -- 
 1.7.1
-
 
