@@ -1,34 +1,33 @@
-From 2c6e62310e77521ee7548d7e286bc4b3ffe6e5c9 Mon Sep 17 00:00:00 2001
-From: root <root@li309-28.members.linode.com>
-Date: Fri, 19 Jul 2013 19:07:49 +0000
-Subject: [PATCH] Amazing Ancas Hard Work
+From 57a737d4212211b728a67f096293375076c86e48 Mon Sep 17 00:00:00 2001
+From: karl anderson <karl@2600hz.com>
+Date: Mon, 22 Jul 2013 18:14:03 -0400
+Subject: [PATCH] Ancas cleanup of Karls hacks
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1476 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1513 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   24 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  893 ++++++++++++
  modules/db_kazoo/dbase.h                           |   90 ++
  modules/presence/bind_presence.c                   |    2 +
  modules/presence/bind_presence.h                   |    3 +
- modules/presence/notify.c                          |   82 ++
+ modules/presence/notify.c                          |   94 ++
  modules/presence/notify.h                          |    3 +
  modules/presence/presence.c                        |   12 +-
- modules/presence/subscribe.c                       |    2 +
  modules/presence_dialoginfo/bind_pres_dialoginfo.h |   28 +
- modules/presence_dialoginfo/notify_body.c          |    6 +-
- modules/presence_dialoginfo/notify_body.h          |    1 +
+ modules/presence_dialoginfo/notify_body.c          |   63 +-
+ modules/presence_dialoginfo/notify_body.h          |    7 +
  modules/presence_dialoginfo/presence_dialoginfo.c  |   16 +
  modules/pua/pua.c                                  |    4 +-
  modules/pua_dialoginfo/Makefile                    |    2 +
  modules/pua_dialoginfo/bind_dialoginfo.h           |   29 +
- modules/pua_dialoginfo/dialog_publish.c            |   89 ++-
+ modules/pua_dialoginfo/dialog_publish.c            |   90 ++-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 24 files changed, 3054 insertions(+), 20 deletions(-)
+ 23 files changed, 3137 insertions(+), 48 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -78,10 +77,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..42dbef3
+index 0000000..f7632d6
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1476 @@
+@@ -0,0 +1,1513 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -115,23 +114,25 @@ index 0000000..42dbef3
 +int dbk_initialize_pres_htable(void);
 +
 +#define BLF_MAX_DIALOGS 8
-+#define BLF_JSON_FROM      "From" 
-+#define BLF_JSON_TO        "To"
-+#define BLF_JSON_CALLID    "Call-ID"
-+#define BLF_JSON_TOTAG     "To-Tag"
-+#define BLF_JSON_FROMTAG   "From-Tag"
-+#define BLF_JSON_STATE     "State"
-+#define BLF_JSON_USER      "User"
-+#define BLF_JSON_FROM     "From"
-+#define BLF_JSON_QUEUE     "Queue"
-+#define BLF_JSON_EXPIRES   "Expires"
++#define BLF_JSON_FROM      	"From" 
++#define BLF_JSON_TO        	"To"
++#define BLF_JSON_CALLID    	"Call-ID"
++#define BLF_JSON_TOTAG     	"To-Tag"
++#define BLF_JSON_FROMTAG   	"From-Tag"
++#define BLF_JSON_STATE     	"State"
++#define BLF_JSON_USER      	"User"
++#define BLF_JSON_FROM     	"From"
++#define BLF_JSON_QUEUE     	"Queue"
++#define BLF_JSON_EXPIRES	"Expires"
 +#define BLF_JSON_APP_NAME       "App-Name"
 +#define BLF_JSON_APP_VERSION    "App-Version"
 +#define BLF_JSON_NODE           "Node"
 +#define BLF_JSON_SERVERID       "Server-ID"
 +#define BLF_JSON_EVENT_CATEGORY "Event-Category"
 +#define BLF_JSON_EVENT_NAME     "Event-Name" 
-+#define BLF_JSON_TYPE           "Type" 
++#define BLF_JSON_TYPE           "Type"
++#define BLF_JSON_MSG_ID         "Msg-ID"
++#define BLF_JSON_DIRECTION      "Direction"
 +
 +static char blf_queue_name_buffer[128];
 +static amqp_bytes_t blf_queue;
@@ -142,6 +143,7 @@ index 0000000..42dbef3
 +
 +int dbk_initialize_presence(void)
 +{
++        LM_DBG("dbk_initialize_presence\n");
 +	/* bind to presence module */
 +	bind_presence_t bind_presence= (bind_presence_t)find_export("bind_presence", 1,0);
 +	if (!bind_presence) {
@@ -178,7 +180,7 @@ index 0000000..42dbef3
 +		LM_ERR("Failed to initialize presence htable\n");
 +		return -1;
 +	}
-+	LM_INFO("Initialized pres_htable\n");
++	LM_DBG("Initialized pres_htable\n");
 +
 +
 +	if ( pv_parse_spec(&sht_name, &sht_spec) == NULL ) {
@@ -197,6 +199,7 @@ index 0000000..42dbef3
 +void dbk_start_presence_rmqp_consumer_processes(struct db_id* id)
 +{
 +	int i;
++        LM_DBG("dbk_start_presence_rmqp_consumer_processes\n");
 +	for (i= 0; i< DBK_PRES_WORKERS_NO; i++) {
 +		int newpid = fork_process(PROC_NOCHLDINIT, "RMQP PRESENCE WORKER", 0);
 +		if(newpid < 0) {
@@ -204,10 +207,10 @@ index 0000000..42dbef3
 +			return;
 +		} else if(newpid == 0) {
 +			// child - this will loop forever
-+			LM_INFO("Created dbk pres process %d\n", newpid);
++			LM_DBG("Created dbk pres process %d\n", newpid);
 +			rmqp_consumer_loop(id);
 +		} else {
-+			LM_INFO("Created dbk pres process %d\n", newpid);
++			LM_DBG("Created dbk pres process %d\n", newpid);
 +		}	
 +	}
 +}
@@ -221,67 +224,63 @@ index 0000000..42dbef3
 +	size_t body_target;
 +	size_t body_received = 0;
 +	char body[2048];
-+	static amqp_bytes_t routing_key= {3, "BLF"};
 +	static amqp_bytes_t exch = {10, "dialoginfo"};
 +	rmq_conn_t * rconn;
 +	
-+	LM_INFO("Start rmqp consumer\n");
++	LM_DBG("Start rmqp consumer\n");
 +	rconn = rmqp_new_connection(id);
 +	if (rconn == NULL) {
-+		LM_ERR("Failed to create rmqp connection\n");
-+		return;
++          LM_ERR("Failed to create rmqp connection\n");
++          return;
 +	}
-+	LM_INFO("Created rmqp connection\n");
++	LM_DBG("Created rmqp connection\n");
 +	/* Declare reply queue and start consumer */
-+
-+//	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("fanout"),
++        
++        //	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("fanout"),
 +	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("direct"),
-+                       1, 1, amqp_empty_table);
++                              0, 0, amqp_empty_table);
 +	if (rmq_error("Declaring exchange", amqp_get_rpc_reply(rconn->conn))) {
-+		goto error;
++          goto error;
 +	}
 +
++        amqp_queue_declare(rconn->conn, rconn->channel, blf_queue, 0, 0, 1, 1, amqp_empty_table);
++        if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
++          goto error;
++        }
++        LM_DBG("Queue declare was successful\n");
 +
-+	amqp_queue_declare(rconn->conn, rconn->channel, blf_queue, 0, 0, 1, 1, amqp_empty_table);
-+	if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
-+		goto error;
-+	}
-+	LM_INFO("Queue declare was successful\n");
-+
-+	amqp_queue_bind(rconn->conn, rconn->channel, blf_queue, exch, routing_key, amqp_empty_table);
++	amqp_queue_bind(rconn->conn, rconn->channel, blf_queue, exch, blf_queue, amqp_empty_table);
 +	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
 +		goto error;
 +	}
-+	amqp_basic_consume(rconn->conn, rconn->channel, blf_queue, amqp_empty_bytes, 0, 0, 1, amqp_empty_table);
++
++	amqp_basic_consume(rconn->conn, rconn->channel, blf_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
 +	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
 +		goto error;
 +	}
 +
-+	LM_INFO("Start loop\n");
++	LM_DBG("Start loop\n");
 +	while (1) {
-+		LM_INFO("Wait for a packet\n");
++		LM_DBG("Wait for a packet\n");
 +		while (1) {
-+			LM_INFO("Before amqp_maybe_release_buffers\n");
 +			amqp_maybe_release_buffers(rconn->conn);
-+			LM_INFO("After amqp_maybe_release_buffers\n");
 +			result = amqp_simple_wait_frame(rconn->conn, &frame);
-+			LM_INFO("Result: %d\n", result);
 +			if (result < 0) {
 +				break;
 +			}
 +
-+			LM_INFO("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
++			LM_DBG("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
 +			if (frame.frame_type != AMQP_FRAME_METHOD) {
 +				continue;
 +			}
 +
-+			LM_INFO("Method: %s\n", amqp_method_name(frame.payload.method.id));
++			LM_DBG("Method: %s\n", amqp_method_name(frame.payload.method.id));
 +		 	if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) {
 +				continue;
 +			}
 +
 +			d = (amqp_basic_deliver_t *) frame.payload.method.decoded;
-+			LM_INFO("Delivery: %u exchange: %.*s routingkey: %.*s\n",
++			LM_DBG("Delivery: %u exchange: %.*s routingkey: %.*s\n",
 +					(unsigned) d->delivery_tag,
 +					(int) d->exchange.len, (char *) d->exchange.bytes,
 +					(int) d->routing_key.len, (char *) d->routing_key.bytes);
@@ -297,10 +296,9 @@ index 0000000..42dbef3
 +			}
 +			p = (amqp_basic_properties_t *) frame.payload.properties.decoded;
 +			if (p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG) {
-+				LM_INFO("Content-type: %.*s\n",
++				LM_DBG("Content-type: %.*s\n",
 +				(int) p->content_type.len, (char *) p->content_type.bytes);
 +			}
-+			LM_INFO("----\n");
 +
 +			body_target = frame.payload.properties.body_size;
 +			body_received = 0;
@@ -321,7 +319,7 @@ index 0000000..42dbef3
 +
 +				body_received += frame.payload.body_fragment.len;
 +
-+				LM_INFO("%.*s\n", (int)frame.payload.body_fragment.len,
++				LM_DBG("%.*s\n", (int)frame.payload.body_fragment.len,
 +						(char*)frame.payload.body_fragment.bytes);
 +			}
 +
@@ -342,7 +340,7 @@ index 0000000..42dbef3
 +		}
 +
 +		body[body_received] = '\0';
-+		LM_INFO("Received update %s\n", body);
++		LM_DBG("Received update %s\n", body);
 +	
 +		if ( rmqp_pres_update_handle(body) < 0) {
 +			LM_ERR("Failed to add to the update queue\n");
@@ -439,7 +437,7 @@ index 0000000..42dbef3
 +	dbk_pres_user_t** pu_prev_ret, dbk_pres_user_t *prev_pu_addr)
 +{
 +	dbk_pres_user_t *pu, *pu_prev = NULL;
-+	
++
 +	for (pu = dbk_phtable[hash_code].pu; pu; pu = pu->next) {
 +		if (prev_pu_addr && prev_pu_addr != pu) {
 +			continue;
@@ -461,6 +459,7 @@ index 0000000..42dbef3
 +{
 +	dbk_pres_dialog_t* pd = (dbk_pres_dialog_t*)shm_malloc(sizeof(dbk_pres_dialog_t) + callid->len+
 +		localtag->len + remotetag->len);
++
 +	if ( pd == NULL) {
 +		LM_ERR("No more shared memory\n");
 +		return NULL;
@@ -501,6 +500,7 @@ index 0000000..42dbef3
 +dbk_pres_user_t* dbk_new_pres_user(str* user, str* callid, str* localtag, str* remotetag, str* body) 
 +{
 +	dbk_pres_user_t* pu = (dbk_pres_user_t*)shm_malloc(sizeof(dbk_pres_user_t) + user->len);
++
 +	if ( pu == NULL) {
 +		LM_ERR("No more shared memory\n");
 +		return NULL;
@@ -522,6 +522,7 @@ index 0000000..42dbef3
 +	unsigned int hash_code) 
 +{
 +	dbk_pres_user_t* pu = dbk_new_pres_user(user, callid, localtag, remotetag, body);
++
 +	if (pu == NULL) {
 +		LM_ERR("Failed to create new pres user\n");
 +		return -1;
@@ -573,8 +574,6 @@ index 0000000..42dbef3
 +	dbk_pres_dialog_t* pd;
 +	int i;
 +
-+	LM_INFO("dbk_blf_copy_bodies\n");
-+
 +	for (pd = pu->pd, i= *dlg_no; pd && i< BLF_MAX_DIALOGS; pd = pd->next) {
 +		if ( pd == curr_pd) {
 +			continue;
@@ -608,18 +607,48 @@ index 0000000..42dbef3
 +	struct sip_uri uri;
 +	int i;
 +
-+	LM_INFO("Aggregate %d bodies\n", dlg_no);
++	LM_DBG("Aggregate %d bodies\n", dlg_no);
 +
 +	if (parse_uri(user->s, user->len, &uri) < 0) {
 +		LM_ERR("Failed to parse uri\n");
 +		return NULL;
 +	}
 +
-+	for (i = 0; i< dlg_no; i++) {
++	for (i = 0; i < dlg_no; i++) {
 +		dlg_bodies_p[i] = &dlg_bodies[i];
 +	}
 +
 +	return pres_dialoginfo_api.agg_dialoginfo(&uri.user, &uri.host, dlg_bodies_p, dlg_no);
++}
++
++int dbk_phtable_dialoginfo(str* local_user)
++{
++        dbk_pres_user_t* pu, *pu_prev = NULL;
++	str* body = NULL;
++        unsigned int hash_code = core_hash(local_user, 0, dbk_phtable_size);
++	str dlg_bodies[BLF_MAX_DIALOGS], event = str_init("dialog");
++	int dlg_no = 0;
++
++        lock_get(&dbk_phtable[hash_code].lock);
++	pu = dbk_pres_search_pu(hash_code, local_user, &pu_prev, 0);
++        if (pu != NULL && pu->pd != NULL) {
++        	dbk_blf_copy_bodies(pu, NULL, dlg_bodies, &dlg_no);
++        }
++        lock_release(&dbk_phtable[hash_code].lock);
++
++        body = dbk_blf_aggregate_body(local_user, dlg_bodies, dlg_no);
++
++        while(dlg_no) {
++        	pkg_free(dlg_bodies[--dlg_no].s);
++        }
++
++        if (presence_api.notify_watchers(local_user, &event, body) < 0) {
++        	LM_ERR("Failed to notify watchers\n");
++        	return -1;
++	}
++
++	dbk_free_xml(body);
++	return 0;
 +}
 +
 +str* dbk_phtable_update(str* local_user, str* remote_user, str* callid,
@@ -635,33 +664,30 @@ index 0000000..42dbef3
 +	int i;
 +
 +	if (terminated) {
-+		LM_INFO("Update for terminated state\n");
++		LM_DBG("Update for terminated state\n");
 +	}
 +
-+	LM_INFO("dbk_phtable_update: start\n");
 +	lock_get(&dbk_phtable[hash_code].lock);
 +	pu = dbk_pres_search_pu(hash_code, local_user, &pu_prev, 0);
-+	LM_INFO("searched record\n");
 +
 +	/**  1. No record for user */
 +	if (pu == NULL) {	
 +		lock_release(&dbk_phtable[hash_code].lock);
-+		LM_INFO("no record\n");
 +		if (!terminated) {		
-+			LM_INFO("No record found, created a new one\n");
++			LM_DBG("No record found for %s, created a new one\n", local_user->s);
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
 +				LM_ERR("Failed to construct BLF XML doc\n");
 +				return NULL;
 +			}
-+			LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++			LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
 +
 +			if ( dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code) < 0) {
 +				LM_ERR("Failed to insert new pres_user in htable\n");
 +			}
 +			return body;
 +		}
-+		LM_INFO("No record found and state terminated, do nothing\n");
++		LM_DBG("No record found and state terminated, do nothing\n");
 +		return pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +	}
@@ -677,13 +703,13 @@ index 0000000..42dbef3
 +		}
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		if (!terminated) {
-+			LM_INFO("Dialog record not found, insert a new one\n");
++			LM_DBG("Dialog record not found, insert a new one\n");
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
 +				LM_ERR("Failed to construct BLF XML doc\n");
 +				goto ret_current_dialog;
 +			}
-+			LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++			LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
 +
 +			pd = dbk_new_pres_dialog(callid, localtag, remotetag, body);
 +			if (pd == NULL) {
@@ -719,7 +745,7 @@ index 0000000..42dbef3
 +	}
 +
 +	if (!terminated) {
-+		LM_INFO("Found record and matching dialog, update the body\n");
++		LM_DBG("Found record and matching dialog, update the body\n");
 +		/* update only the body */
 +		lock_release(&dbk_phtable[hash_code].lock);
 +
@@ -728,7 +754,7 @@ index 0000000..42dbef3
 +			LM_ERR("Failed to construct BLF XML doc\n");
 +			goto ret_current_dialog;
 +		}
-+		LM_INFO("dialoginfo body [%.*s]\n", body->len, body->s);
++		LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
 +
 +		lock_get(&dbk_phtable[hash_code].lock);
 +		/* search again the corresponding pu;
@@ -736,7 +762,7 @@ index 0000000..42dbef3
 +		pu = dbk_pres_search_pu(hash_code, local_user, 0, pu); 
 +		if (pu == NULL) { /* pres user deleted in the meantime (my dialog ended) */
 +			lock_release(&dbk_phtable[hash_code].lock);
-+			LM_INFO("pu deleted in the meantime (my dialog must have ended)\n");
++			LM_DBG("pu deleted in the meantime (my dialog must have ended)\n");
 +			dbk_free_xml(body);
 +			body = NULL;
 +			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
@@ -745,7 +771,7 @@ index 0000000..42dbef3
 +		pd = dbk_pres_pu_search_pd(pu, callid, localtag, remotetag, &pd_prev, pd);
 +		if (pd == NULL) {
 +			lock_release(&dbk_phtable[hash_code].lock);
-+			LM_INFO("pd deleted in the meantime (my dialog must have ended)\n");
++			LM_DBG("pd deleted in the meantime (my dialog must have ended)\n");
 +			dbk_free_xml(body);
 +			body = NULL;
 +			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
@@ -768,9 +794,9 @@ index 0000000..42dbef3
 +		}
 +		lock_release(&dbk_phtable[hash_code].lock);
 +	} else {
-+		LM_INFO("Found record and matching dialog, state terminated, delete\n");
++		LM_DBG("Found record and matching dialog, state terminated, delete\n");
 +		if (pd_prev == NULL && pd->next == NULL) { // there is no other dialog record
-+			LM_INFO("No other dialog - delete pu record\n");
++			LM_DBG("No other dialog - delete pu record\n");
 +			/* delete pu */
 +			if (pu_prev) {
 +				pu_prev->next = pu->next;
@@ -784,7 +810,7 @@ index 0000000..42dbef3
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +			goto ret_current_dialog;
 +		} else {
-+			LM_INFO("Other dialog - delete pd record\n");
++			LM_DBG("Other dialog - delete pd record\n");
 +			/* delete pd */
 +			if (pd_prev) {
 +				pd_prev->next = pd->next;
@@ -834,13 +860,12 @@ index 0000000..42dbef3
 +		LM_ERR("Failed to update in htable\n");
 +		return -1;
 +	}
-+	LM_INFO("Call notify watchers\n");
++
 +	/* call refresh_watchers from presence */
-+	if (presence_api.notify_watchers(local_user, &event, body) < 0) {
++        if (presence_api.notify_watchers(local_user, &event, body) < 0) {
 +		LM_ERR("Failed to notify watchers\n");
 +		goto error;
 +	}
-+
 +	dbk_free_xml(body);
 +	return 0;
 +error:
@@ -849,24 +874,21 @@ index 0000000..42dbef3
 +}
 +#define json_extract_field(json_name, field)  do { \
 +	struct json_object* obj = json_object_object_get(json_obj, json_name); \
-+	if (is_error(obj)) { \
-+		LM_ERR("Error parsing json: %s\n", json_tokener_errors[-(unsigned long)obj]);\
-+		goto error; \
-+	} \
 +	field.s = (char*)json_object_get_string(obj); \
 +	if (field.s == NULL) { \
 +		LM_DBG("Json-c error - failed to extract field [%s]\n", json_name); \
++                field.s = ""; \
 +	} else { \
 +		field.len = strlen(field.s); \
 +	} \
-+	LM_INFO("%s: [%s]\n", json_name, field.s?field.s:"Empty"); \
++	LM_DBG("%s: [%s]\n", json_name, field.s?field.s:"Empty"); \
 +} while (0);
 +
 +
 +int dbk_phtable_flush(int flush_all, str* user)
 +{
 +	dbk_pres_user_t* pu;
-+	
++
 +	if (flush_all) {
 +		int i;
 +		dbk_pres_user_t* pu_next;
@@ -889,7 +911,7 @@ index 0000000..42dbef3
 +		lock_get(&dbk_phtable[hash_code].lock);
 +		pu = dbk_pres_search_pu(hash_code, user, &pu_prev, 0);
 +		if (pu == NULL) {
-+			LM_INFO("FLUSH: No record found for user %.*s\n", user->len, user->s);
++			LM_DBG("FLUSH: No record found for user %.*s\n", user->len, user->s);
 +			lock_release(&dbk_phtable[hash_code].lock);
 +		} else {
 +			if (pu_prev) { 
@@ -900,6 +922,7 @@ index 0000000..42dbef3
 +			lock_release(&dbk_phtable[hash_code].lock);
 +			dbk_free_pu(pu);
 +		}
++		dbk_phtable_dialoginfo(user);
 +	}
 +	return 0;
 +}
@@ -918,8 +941,6 @@ index 0000000..42dbef3
 +	}
 +
 +	return dbk_phtable_flush(flush_all, &user);
-+error:
-+	return -1;
 +}
 +
 +struct mi_root * mi_dbk_phtable_flush(struct mi_root *cmd, void *param)
@@ -929,15 +950,13 @@ index 0000000..42dbef3
 +	str user;
 +	int flush_all = 0;
 +
-+	LM_INFO("Entered mi_dbk_phtable_flush function\n");
-+
 +	node = cmd->node.kids;
 +	if(node == NULL) {
 +		LM_ERR("Null command- missing parameters\n");
 +		return 0;
 +	}
 +
-+	LM_INFO("Get type\n");
++	LM_DBG("Get type\n");
 +
 +	/* Get type */
 +	type = node->value;
@@ -946,10 +965,10 @@ index 0000000..42dbef3
 +		return init_mi_tree(404, "Missing parameter ('all' or 'user')", 35);
 +	}
 +
-+	LM_INFO("Flush type=[%.*s]\n", type.len, type.s);
++	LM_DBG("Flush type=[%.*s]\n", type.len, type.s);
 +
 +	if (type.len == 3 && strncmp(type.s, "all", 3) == 0) {
-+		LM_INFO("Flush all\n");
++		LM_DBG("Flush all\n");
 +		flush_all = 1;
 +	} else {
 +		node = node->next;
@@ -960,7 +979,7 @@ index 0000000..42dbef3
 +			LM_ERR( "No user uri provided\n");
 +			return init_mi_tree(404, "No user uri provided", 20);
 +		}
-+		LM_INFO("Flush user [%.*s]\n", user.len, user.s);
++		LM_DBG("Flush user [%.*s]\n", user.len, user.s);
 +	}	
 +
 +	if (dbk_phtable_flush(flush_all, &user) < 0 ) {
@@ -986,7 +1005,8 @@ index 0000000..42dbef3
 +	str callid= {0, 0}, fromtag= {0, 0}, totag= {0, 0};
 +	str state= {0, 0};
 +	str event_name={0, 0};
-+	struct json_object *json_obj;	
++        str direction={0, 0};
++	struct json_object *json_obj;
 +	int ret = 0;
 +
 +	/* extract info from json and construct xml */
@@ -1006,8 +1026,9 @@ index 0000000..42dbef3
 +		json_extract_field(BLF_JSON_FROM, from_user);
 +		json_extract_field(BLF_JSON_TO, to_user);
 +		json_extract_field(BLF_JSON_CALLID, callid);
-+		json_extract_field(BLF_JSON_FROMTAG, fromtag);
-+		json_extract_field(BLF_JSON_TOTAG, totag);
++                json_extract_field(BLF_JSON_FROMTAG, fromtag);
++                json_extract_field(BLF_JSON_TOTAG, totag);
++                json_extract_field(BLF_JSON_DIRECTION, direction);
 +		json_extract_field(BLF_JSON_STATE, state);
 +
 +		if ( !from_user.len || !to_user.len || !callid.len || !state.len) {
@@ -1015,12 +1036,20 @@ index 0000000..42dbef3
 +			json_object_put(json_obj);
 +			goto error;
 +		}
++                
++                if (!strcmp(direction.s, "inbound")) {
++                        LM_DBG("channel is the initiator\n");
++                        ret = dbk_pres_update_and_notify(&from_user, &to_user, &callid, &fromtag, &totag, &state, 1);
++                } else {
++                        LM_DBG("channel is the recipient\n");
++                        ret = dbk_pres_update_and_notify(&to_user, &from_user, &callid, &totag, &fromtag, &state, 0);
++                }
 +
-+		if (dbk_pres_update_and_notify(&from_user, &to_user, &callid, &fromtag, &totag, &state, 1) < 0 ||
-+			dbk_pres_update_and_notify(&to_user, &from_user, &callid, &totag, &fromtag, &state, 0) < 0) {
++                if (ret < 0) {
 +			LM_ERR("Failed to process dialoginfo update command\n");
 +			ret = -1;
 +		}
++                
 +	}
 +	json_object_put(json_obj);
 +	return ret;
@@ -1069,9 +1098,11 @@ index 0000000..42dbef3
 +	str body[BLF_MAX_DIALOGS];
 +	int row_cnt = 0;
 +
++        LM_DBG("dbk_presence_query!!!\n");
 +
 +	if (_n == 2 && _k[0]->len == str_expires_col.len &&
 +		strncmp(_k[0]->s, str_expires_col.s, str_expires_col.len) == 0 ) {
++                LM_DBG("dbk_presence_query goes to dbk_presence_query_expired\n");
 +		return dbk_presence_query_expired(_r);
 +	}
 +
@@ -1103,6 +1134,8 @@ index 0000000..42dbef3
 +	}
 +	pres_uri.s = pres_uri_buf;
 +	pres_uri.len = sprintf(pres_uri_buf, "sip:%.*s@%.*s", username.len, username.s, domain.len, domain.s);
++
++	LM_DBG("dbk_presence_query %s %s %s\n", username.s, domain.s, pres_uri.s);
 +	
 +	db_res = db_new_result();
 +	if ( db_res == NULL ) {
@@ -1120,32 +1153,34 @@ index 0000000..42dbef3
 +	pu = dbk_pres_search_pu(hash_code, &pres_uri, 0, 0);
 +
 +	if ( pu == NULL ) {
-+		LM_INFO("No dialog info found for user [%.*s]\n", pres_uri.len, pres_uri.s);
++		LM_DBG("No dialog info found for user [%.*s]\n", pres_uri.len, pres_uri.s);
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		*_r = db_res;
 +		return 0;
 +	}
++	LM_DBG("Found presence user record\n");
 +	if ( pu->pd == NULL ) {
 +		LM_ERR("Critical bad data in phtable: pu->pd == NULL\n");
 +		goto error1;
 +	}
 +	pd = pu->pd;
 +	row_cnt = 0;	
-+	while ( pd == NULL && row_cnt < BLF_MAX_DIALOGS ) {
-+		body[i].s = (char*)pkg_malloc(pu->pd->body.len + 1);
-+		if (body[i].s == NULL) {
++	while ( pd != NULL && row_cnt < BLF_MAX_DIALOGS ) {
++		body[row_cnt].s = (char*)pkg_malloc(pu->pd->body.len + 1);
++		if (body[row_cnt].s == NULL) {
 +			LM_ERR("No more shared memory\n");
 +			goto error1;
 +		}
-+		memcpy(body[i].s, pu->pd->body.s, pu->pd->body.len);
-+		body[i].len = pu->pd->body.len;
-+		body[i].s[body[i].len] = '\0';
++		memcpy(body[row_cnt].s, pu->pd->body.s, pu->pd->body.len);
++		body[row_cnt].len = pu->pd->body.len;
++		body[row_cnt].s[body[row_cnt].len] = '\0';
 +		pd = pd->next;
 +		row_cnt++;
 +	} 
 +
 +	lock_release(&dbk_phtable[hash_code].lock);
 +
++	LM_DBG("The user has %d active dialogs\n", row_cnt);
 +	RES_COL_N(db_res) = _nc;
 +	RES_ROW_N(db_res) = row_cnt;
 +	if (db_allocate_rows(db_res) < 0) {
@@ -1188,13 +1223,13 @@ index 0000000..42dbef3
 +
 +		/* complete the row with the columns */
 +		for(col = 0; col< _nc; col++) {
-+			LM_INFO("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
++			LM_DBG("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
 +			RES_ROWS(db_res)[0].values[col].type = DB1_STR;
 +			if (strncmp(_c[col]->s, "body", _c[col]->len) == 0 ) {
 +				RES_ROWS(db_res)[i].values[col].val.str_val = body[i];
 +				RES_ROWS(db_res)[i].values[col].free  = 1;
 +				RES_ROWS(db_res)[i].values[col].nul  = 0;
-+				LM_INFO("Body in result: [%s]\n", RES_ROWS(db_res)[i].values[col].val.string_val);
++				LM_DBG("Body in result: [%s]\n", RES_ROWS(db_res)[i].values[col].val.string_val);
 +			} else {
 +				RES_ROWS(db_res)[i].values[col].val.str_val.s = "";
 +				RES_ROWS(db_res)[i].values[col].val.str_val.len = 0;
@@ -1204,6 +1239,7 @@ index 0000000..42dbef3
 +		}
 +	}
 +
++	LM_DBG("Returned [%d] rows\n", row_cnt);
 +	*_r = db_res;
 +	return 0;
 +
@@ -1227,20 +1263,21 @@ index 0000000..42dbef3
 +	rmq_conn_t* rconn = (rmq_conn_t*)_h->tail;
 +	amqp_bytes_t amqp_mb;
 +	static amqp_bytes_t routing_key= {3, "BLF"};
-+
-+	if (_n != 6) {
-+		LM_ERR("Inconsistency, expected 6 columns\n");
-+		return -1;
-+	}
-+
 +	str from_user = db_val[0].val.str_val;
 +	str to_user   = db_val[1].val.str_val;
 +	str state     = db_val[2].val.str_val;
 +	str callid    = db_val[3].val.str_val;
 +	str from_tag  = db_val[4].val.str_val;
 +	str to_tag    = db_val[5].val.str_val;
++	str unique_string;  
 +
-+	LM_INFO("from_user=[%.*s] to_user=[%.*s] callid=[%.*s] state=[%.*s]\n",
++	if (_n != 6) {
++		LM_ERR("Inconsistency, expected 6 columns\n");
++		return -1;
++	}
++
++
++	LM_DBG("from_user=[%.*s] to_user=[%.*s] callid=[%.*s] state=[%.*s]\n",
 +		from_user.len, from_user.s, to_user.len, to_user.s, callid.len, callid.s, state.len, state.s);
 +
 +	/* construct json */	
@@ -1251,7 +1288,7 @@ index 0000000..42dbef3
 +			json_tokener_errors[-(unsigned long)json_object]);
 +		return -1;
 +	} 
-+	LM_INFO("Constructed new json object\n");
++
 +	json_object_object_add(json_object, BLF_JSON_FROM, json_object_new_string_len(from_user.s, from_user.len));
 +	json_object_object_add(json_object, BLF_JSON_TO, json_object_new_string_len(to_user.s, to_user.len));
 +	json_object_object_add(json_object, BLF_JSON_STATE, json_object_new_string_len(state.s, state.len));
@@ -1260,21 +1297,23 @@ index 0000000..42dbef3
 +	json_object_object_add(json_object, BLF_JSON_TOTAG, json_object_new_string_len(to_tag.s, to_tag.len));
 +	json_object_object_add(json_object, BLF_JSON_EVENT_CATEGORY, json_object_new_string("presence"));
 +	json_object_object_add(json_object, BLF_JSON_EVENT_NAME, json_object_new_string("update"));
-+	
++	tmb.generate_callid(&unique_string);
++	json_object_object_add(json_object, BLF_JSON_MSG_ID, json_object_new_string_len(unique_string.s, unique_string.len));
++
 +	amqp_mb.bytes = (char*)json_object_to_json_string(json_object);
 +	if (amqp_mb.bytes == NULL) {
 +		LM_ERR("Failed to get json string\n");
 +		goto error;
 +	}
 +	amqp_mb.len   = strlen(amqp_mb.bytes); 
-+	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	LM_DBG("AMQP: body: %s\n", (char*)amqp_mb.bytes);
 +
 +	/* send to rabbitmq */
 +
-+	LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
-+	LM_INFO("AMQP: channel %d\n", rconn->channel);
-+	LM_INFO("AMQP: routing key [%s]\n", (char*)routing_key.bytes);
-+	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	LM_DBG("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_DBG("AMQP: channel %d\n", rconn->channel);
++	LM_DBG("AMQP: routing key [%s]\n", (char*)blf_queue.bytes);
++	LM_DBG("AMQP: body: %s\n", (char*)amqp_mb.bytes);
 +	
 +	amqp_basic_properties_t props;
 +	memset(&props, 0, sizeof(amqp_basic_properties_t));
@@ -1290,14 +1329,11 @@ index 0000000..42dbef3
 +			&props,
 +			amqp_mb);
 +
-+
 +	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
 +		LM_ERR("Failed to publish\n");
 +		goto error;
 +	}
 +
-+	LM_INFO("Published with success\n");
-+	
 +	json_object_put(json_object);
 +	
 +	return 0;
@@ -1398,6 +1434,7 @@ index 0000000..42dbef3
 +	static amqp_bytes_t routing_key = {15, "dialoginfo_subs"};
 +	static amqp_bytes_t amqp_mb;
 +	json_object *json_object = NULL;
++	str unique_string;
 +
 +	json_object = json_object_new_object();
 +	if ( is_error(json_object) ) {
@@ -1405,7 +1442,7 @@ index 0000000..42dbef3
 +			json_tokener_errors[-(unsigned long)json_object]);
 +		return -1;
 +	} 
-+	LM_INFO("Constructed new json object\n");
++
 +	json_object_object_add(json_object, BLF_JSON_USER, json_object_new_string_len(user->s, user->len));
 +	json_object_object_add(json_object, BLF_JSON_FROM, json_object_new_string_len(from_user->s, from_user->len));
 +	json_object_object_add(json_object, BLF_JSON_QUEUE, json_object_new_string_len(blf_queue.bytes, blf_queue.len));
@@ -1413,9 +1450,11 @@ index 0000000..42dbef3
 +	json_object_object_add(json_object, BLF_JSON_APP_NAME, json_object_new_string(NAME));
 +	json_object_object_add(json_object, BLF_JSON_APP_VERSION, json_object_new_string(VERSION));
 +	json_object_object_add(json_object, BLF_JSON_NODE, json_object_new_string(node_name));
-+	json_object_object_add(json_object, BLF_JSON_SERVERID, json_object_new_string(""));
++	json_object_object_add(json_object, BLF_JSON_SERVERID, json_object_new_string_len(blf_queue.bytes, blf_queue.len));
 +	json_object_object_add(json_object, BLF_JSON_EVENT_CATEGORY, json_object_new_string("presence"));
 +	json_object_object_add(json_object, BLF_JSON_EVENT_NAME, json_object_new_string("subscription"));
++	tmb.generate_callid(&unique_string);
++	json_object_object_add(json_object, BLF_JSON_MSG_ID, json_object_new_string_len(unique_string.s, unique_string.len));
 +
 +	amqp_mb.bytes = (char*)json_object_to_json_string(json_object);
 +	if (amqp_mb.bytes == NULL) {
@@ -1423,15 +1462,15 @@ index 0000000..42dbef3
 +		goto error;
 +	}
 +	amqp_mb.len   = strlen(amqp_mb.bytes); 
-+	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	LM_DBG("AMQP: body: %s\n", (char*)amqp_mb.bytes);
 +
 +	/* send to rabbitmq */
 +
-+	//LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
-+	LM_INFO("AMQP: exchange [%.*s]\n", (int)exchange.len, (char*)exchange.bytes);
-+	LM_INFO("AMQP: channel %d\n", rconn->channel);
-+	LM_INFO("AMQP: routing key [%s]\n", (char*)routing_key.bytes);
-+	LM_INFO("AMQP: body: %s\n", (char*)amqp_mb.bytes);
++	//LM_DBG("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_DBG("AMQP: exchange [%.*s]\n", (int)exchange.len, (char*)exchange.bytes);
++	LM_DBG("AMQP: channel %d\n", rconn->channel);
++	LM_DBG("AMQP: routing key [%s]\n", (char*)routing_key.bytes);
++	LM_DBG("AMQP: body: %s\n", (char*)amqp_mb.bytes);
 +	
 +	amqp_basic_properties_t props;
 +	memset(&props, 0, sizeof(amqp_basic_properties_t));
@@ -1447,14 +1486,11 @@ index 0000000..42dbef3
 +			&props,
 +			amqp_mb);
 +
-+
 +	if ( rmq_error("Publishing",  amqp_get_rpc_reply(rconn->conn)) ) {
 +		LM_ERR("Failed to publish\n");
 +		goto error;
 +	}
 +
-+	LM_INFO("Published with success\n");
-+	
 +	json_object_put(json_object);
 +	
 +	return 0;
@@ -1484,7 +1520,7 @@ index 0000000..42dbef3
 +		}
 +	}
 +
-+	LM_INFO("i=%d expires=%u\n", i, expires);
++	LM_DBG("i=%d expires=%u\n", i, expires);
 +	if (i == _n) {
 +		LM_ERR("Wrong formated sql insert\n");
 +		return -1;
@@ -1501,7 +1537,7 @@ index 0000000..42dbef3
 +	if (pv_set_spec_value(t->uas.request, &sht_spec, 0, &value) < 0) {
 +		LM_ERR("Failed to add sht value\n");
 +	}
-+	LM_INFO("Stored $sht(dbk=>%.*s)=[%.*s]\n", t->callid.len,  t->callid.s, value.rs.len, value.rs.s);
++	LM_DBG("Stored $sht(dbk=>%.*s)=[%.*s]\n", t->callid.len,  t->callid.s, value.rs.len, value.rs.s);
 +
 +	return dbk_presence_subscribe_alert_kazoo((rmq_conn_t*)_h->tail, &user,
 +			expires, &((to_body_t*)t->uas.request->from->parsed)->uri);
@@ -1527,7 +1563,7 @@ index 0000000..42dbef3
 +	}
 +
 +	if (i == _n) {
-+		LM_INFO("Not an expires update\n");
++		LM_DBG("Not an expires update\n");
 +		return 0;
 +	}
 +
@@ -1547,11 +1583,11 @@ index 0000000..42dbef3
 +		LM_ERR("Failed to add sht value\n");
 +	}	
 +	if (value.rs.len == 0) {
-+		LM_INFO("Failed to get the presentity uri from $sht, take it from request To header\n");
++		LM_DBG("Failed to get the presentity uri from $sht, take it from request To header\n");
 +		value.rs = ((to_body_t*)t->uas.request->to->parsed)->uri;
-+		LM_INFO("Took presentity_uri from To header=[%.*s]\n", value.rs.len, value.rs.s);
++		LM_DBG("Took presentity_uri from To header=[%.*s]\n", value.rs.len, value.rs.s);
 +	} else {
-+		LM_INFO("Found presentity_uri $sht(dbk=>%.*s)=[%.*s]\n", t->callid.len,  t->callid.s, value.rs.len, value.rs.s);
++		LM_DBG("Found presentity_uri $sht(dbk=>%.*s)=[%.*s]\n", t->callid.len,  t->callid.s, value.rs.len, value.rs.s);
 +	}
 +	return dbk_presence_subscribe_alert_kazoo((rmq_conn_t*)_h->tail, &value.rs,
 +			expires, &((to_body_t*)t->uas.request->from->parsed)->uri);
@@ -1783,7 +1819,7 @@ index 0000000..627ae7e
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..aed5d8f
+index 0000000..efc381f
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
 @@ -0,0 +1,893 @@
@@ -1809,7 +1845,7 @@ index 0000000..aed5d8f
 +
 +void rmq_close(rmq_conn_t* rmq)
 +{
-+	LM_INFO("Close rmq connection\n");
++	LM_DBG("Close rmq connection\n");
 +	if (!rmq)
 +		return;
 +	if (rmq->conn) {
@@ -1848,12 +1884,12 @@ index 0000000..aed5d8f
 +	rmq->exchange.len = db_len;
 +
 +
-+	LM_INFO("Created rmq structure %p\n", rmq);
++	LM_DBG("Created rmq structure %p\n", rmq);
 +	if (!(rmq->conn = amqp_new_connection())) {
 +		LM_ERR("cannot create new connection\n");
 +		goto error;
 +	}
-+	LM_INFO("RMQP new connection successfull!\n");
++	LM_DBG("RMQP new connection successfull!\n");
 +
 +	rmq->socket = amqp_tcp_socket_new();
 +	if (!rmq->socket) {
@@ -1866,11 +1902,11 @@ index 0000000..aed5d8f
 +		LM_ERR("Failed to open TCP socket\n");
 +		goto error;
 +	}
-+	LM_INFO("RMQP open socket successfull!\n");
++	LM_DBG("RMQP open socket successfull!\n");
 +
 +	amqp_set_socket(rmq->conn, rmq->socket);
 +
-+	LM_INFO("RMQP set socket successfull!\n");
++	LM_DBG("RMQP set socket successfull!\n");
 +
 +	if ( rmq_error("Logging in", amqp_login(rmq->conn,
 +			"/",
@@ -1882,14 +1918,14 @@ index 0000000..aed5d8f
 +			id->password)) ) {
 +		goto error;
 +	}
-+	LM_INFO("RMQP login successfull!\n");
++	LM_DBG("RMQP login successfull!\n");
 +
 +	rmq->channel = process_no;
 +	amqp_channel_open(rmq->conn, rmq->channel);
 +	if (rmq_error("Opening channel", amqp_get_rpc_reply(rmq->conn))) {
 +		goto error;
 +	}
-+	LM_INFO("Created channel %d\n", rmq->channel);
++	LM_DBG("Created channel %d\n", rmq->channel);
 +
 +	return rmq;
 +
@@ -1909,7 +1945,7 @@ index 0000000..aed5d8f
 +	memset(rmq, 0, sizeof(rmq_conn_t));
 +	rmq->id = id;
 +	rmq->ref = 1;
-+	LM_INFO("Return dummy db conn\n");
++	LM_DBG("Return dummy db conn\n");
 +	return rmq;
 +}
 +	
@@ -1919,10 +1955,10 @@ index 0000000..aed5d8f
 +{
 +	if (strncmp(id->database, "dialoginfo", 10) == 0) {
 +		if ( find_export("bind_presence", 1,0) ) { /* if presence module loaded */
-+			LM_INFO("Process no = %d\n", process_no);
++			LM_DBG("Process no = %d\n", process_no);
 +			if (process_no == 0 ) {
 +				if (!presence_initialized) { /* called from mod_init before any fork */
-+					LM_INFO("Initialize presence\n");
++					LM_DBG("Initialize presence\n");
 +					if(dbk_initialize_presence() < 0) {
 +						LM_ERR("Failed to initialize db_kazoo for presence");
 +						return NULL;
@@ -1931,7 +1967,7 @@ index 0000000..aed5d8f
 +				}
 +				return dbk_dummy_db_conn(id);
 +			} else if (process_no == 1) { /* called from child_init */
-+				LM_INFO("Start presence rmqp consumer processes\n");
++				LM_DBG("Start presence rmqp consumer processes\n");
 +				dbk_start_presence_rmqp_consumer_processes(id);
 +			}
 +			
@@ -1954,7 +1990,7 @@ index 0000000..aed5d8f
 +{
 +	rmq_conn_t * _c;
 +	
-+	LM_INFO("Close connection\n");
++	LM_DBG("Close connection\n");
 +
 +	if (!con) return;
 +	_c = (rmq_conn_t*) con;
@@ -2059,7 +2095,7 @@ index 0000000..aed5d8f
 +		goto error;
 +	}
 +	password.len = strlen(password.s);
-+	LM_INFO("Password: [%s]\n", password.s);
++	LM_DBG("Password: [%s]\n", password.s);
 +
 +	RES_COL_N(db_res) = _nc;
 +	RES_ROW_N(db_res) = 1;
@@ -2099,10 +2135,10 @@ index 0000000..aed5d8f
 +
 +	/* complete the row with the columns */
 +	for(col = 0; col< _nc; col++) {
-+		LM_INFO("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
++		LM_DBG("Col[%d]: %.*s\n", col, _c[col]->len, _c[col]->s);
 +		RES_ROWS(db_res)[0].values[col].type = DB1_STR;
 +		if (strncmp(_c[col]->s, "password", _c[col]->len) == 0 ) {
-+			LM_INFO("Wrote the password in the result\n");
++			LM_DBG("Wrote the password in the result\n");
 +				
 +			RES_ROWS(db_res)[0].values[col].val.str_val.s = (char*)pkg_malloc(password.len+1);
 +			if (RES_ROWS(db_res)[0].values[col].val.str_val.s==NULL) {
@@ -2114,7 +2150,7 @@ index 0000000..aed5d8f
 +
 +			RES_ROWS(db_res)[0].values[col].free  = 1;
 +			RES_ROWS(db_res)[0].values[col].nul  = 0;
-+			LM_INFO("Password in result: [%s]\n", RES_ROWS(db_res)[0].values[col].val.string_val);
++			LM_DBG("Password in result: [%s]\n", RES_ROWS(db_res)[0].values[col].val.string_val);
 +		} else {
 +			RES_ROWS(db_res)[0].values[col].val.str_val.s = "";
 +			RES_ROWS(db_res)[0].values[col].val.str_val.len = 0;
@@ -2149,7 +2185,7 @@ index 0000000..aed5d8f
 +	amqp_bytes_t rpl_queue= {0, 0};
 +	str unique_string = {0, 0};
 +
-+	LM_INFO("RMQ struct %p\n", rconn);
++	LM_DBG("RMQ struct %p\n", rconn);
 +
 +	/* routingkey = authn.req._auth_realm_ */
 +	amqp_rk.bytes = routingkey;
@@ -2190,15 +2226,15 @@ index 0000000..aed5d8f
 +						VERSION, NAME);
 +	amqp_mb.bytes = messagebody;
 +
-+	LM_INFO("AMQP: exchange %.*s\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
-+	LM_INFO("AMQP: channel %d\n", rconn->channel);
-+	LM_INFO("AMQP: routing key %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
-+	LM_INFO("AMQP: body: %s\n", messagebody);
++	LM_DBG("AMQP: exchange %.*s\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_DBG("AMQP: channel %d\n", rconn->channel);
++	LM_DBG("AMQP: routing key %.*s\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_DBG("AMQP: body: %s\n", messagebody);
 +	
 +	/* Declare reply queue and start consumer */
 +	amqp_bytes_t rpl_routing_key= {strlen(serverid), serverid};
 +
-+	LM_INFO("AMQP: before queue_declare rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	LM_DBG("AMQP: before queue_declare rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
 +	amqp_queue_declare_ok_t *r = amqp_queue_declare(rconn->conn, rconn->channel, amqp_empty_bytes, 0, 0, 1, 1,
 +								 amqp_empty_table);
 +	if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
@@ -2215,8 +2251,8 @@ index 0000000..aed5d8f
 +	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
 +		goto error;
 +	}
-+	LM_INFO("AMQP: after queue_bind  rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
-+	LM_INFO("AMQP: after queue_bind  server_id: [%s]\n", serverid);
++	LM_DBG("AMQP: after queue_bind  rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
++	LM_DBG("AMQP: after queue_bind  server_id: [%s]\n", serverid);
 +		/*
 +	publish
 +	*/
@@ -2239,7 +2275,7 @@ index 0000000..aed5d8f
 +		goto error;
 +	}
 +
-+	LM_INFO("Published with success\n");
++	LM_DBG("Published with success\n");
 +
 +	amqp_basic_consume(rconn->conn, rconn->channel, rpl_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
 +	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
@@ -2256,27 +2292,27 @@ index 0000000..aed5d8f
 +	char body[2048];
 +
 +	while (1) {
-+		LM_INFO("Before amqp_maybe_release_buffers\n");
++		LM_DBG("Before amqp_maybe_release_buffers\n");
 +		amqp_maybe_release_buffers(rconn->conn);
-+		LM_INFO("After amqp_maybe_release_buffers\n");
++		LM_DBG("After amqp_maybe_release_buffers\n");
 +		result = amqp_simple_wait_frame(rconn->conn, &frame);
-+		LM_INFO("Result: %d\n", result);
++		LM_DBG("Result: %d\n", result);
 +		if (result < 0) {
 +			break;
 +		}
 +
-+		LM_INFO("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
++		LM_DBG("Frame type: %d channel: %d\n", frame.frame_type, frame.channel);
 +		if (frame.frame_type != AMQP_FRAME_METHOD) {
 +			continue;
 +		}
 +
-+		LM_INFO("Method: %s\n", amqp_method_name(frame.payload.method.id));
++		LM_DBG("Method: %s\n", amqp_method_name(frame.payload.method.id));
 +		if (frame.payload.method.id != AMQP_BASIC_DELIVER_METHOD) {
 +			continue;
 +		}
 +
 +		d = (amqp_basic_deliver_t *) frame.payload.method.decoded;
-+		LM_INFO("Delivery: %u exchange: %.*s routingkey: %.*s\n",
++		LM_DBG("Delivery: %u exchange: %.*s routingkey: %.*s\n",
 +				(unsigned) d->delivery_tag,
 +				(int) d->exchange.len, (char *) d->exchange.bytes,
 +				(int) d->routing_key.len, (char *) d->routing_key.bytes);
@@ -2292,10 +2328,10 @@ index 0000000..aed5d8f
 +		}
 +		p = (amqp_basic_properties_t *) frame.payload.properties.decoded;
 +		if (p->_flags & AMQP_BASIC_CONTENT_TYPE_FLAG) {
-+			LM_INFO("Content-type: %.*s\n",
++			LM_DBG("Content-type: %.*s\n",
 +			(int) p->content_type.len, (char *) p->content_type.bytes);
 +		}
-+		LM_INFO("----\n");
++		LM_DBG("----\n");
 +
 +		body_target = frame.payload.properties.body_size;
 +		body_received = 0;
@@ -2316,7 +2352,7 @@ index 0000000..aed5d8f
 +
 +			body_received += frame.payload.body_fragment.len;
 +
-+			LM_INFO("%.*s\n", (int)frame.payload.body_fragment.len,
++			LM_DBG("%.*s\n", (int)frame.payload.body_fragment.len,
 +					(char*)frame.payload.body_fragment.bytes);
 +		}
 +
@@ -2337,14 +2373,14 @@ index 0000000..aed5d8f
 +	}
 +
 +	body[body_received] = '\0';
-+	LM_INFO("Received reply %s\n", body);
++	LM_DBG("Received reply %s\n", body);
 +
 +	amqp_queue_purge(rconn->conn, rconn->channel, rpl_queue);
 +	if (rmq_error("Purging reply queue", amqp_get_rpc_reply(rconn->conn))) {
 +		LM_ERR("Failed to purge reply queue\n");
 +	}
 +	
-+	LM_INFO("rpl_queue [%.*s], rpl_exchange [%.*s], rpl_routing_key [%.*s]\n",
++	LM_DBG("rpl_queue [%.*s], rpl_exchange [%.*s], rpl_routing_key [%.*s]\n",
 +		 (int)rpl_queue.len, (char*)rpl_queue.bytes, 
 +		 (int)rpl_exch.len, (char*)rpl_exch.bytes, 
 +		 (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes 
@@ -2357,7 +2393,7 @@ index 0000000..aed5d8f
 +	if (rmq_error("Deleting reply queue", amqp_get_rpc_reply(rconn->conn))) {
 +		LM_ERR("Failed to delete queue\n");
 +	}
-+	LM_INFO("rpl_queue [%.*s]\n", (int)rpl_queue.len, (char*)rpl_queue.bytes);
++	LM_DBG("rpl_queue [%.*s]\n", (int)rpl_queue.len, (char*)rpl_queue.bytes);
 +
 +	/* parse json and extract password */
 +	db1_res_t* db_res = dbk_creds_build_result(body, _c, _nc);	
@@ -2400,14 +2436,14 @@ index 0000000..aed5d8f
 +		LM_ERR("invalid parameter value\n");
 +		return -1;
 +	}
-+	LM_INFO("query table=%s\n", _h->table->s);
++	LM_DBG("query table=%s\n", _h->table->s);
 +	
 +	if(strncmp(_h->table->s, "subscriber", 10)== 0 ) {
 +		return dbk_credentials_query(_h, _k, _v, _c, _n, _nc, _r);
 +	} else if(strncmp(_h->table->s, "presentity", 10)== 0 ) {
 +		return dbk_presence_query(_h, _k, _v, _c, _n, _nc, _r);
 +	} else {
-+		LM_INFO("Not supported\n");
++		LM_DBG("Not supported\n");
 +		*_r = db_empty_result();
 +		return 0;
 +	}
@@ -2478,13 +2514,13 @@ index 0000000..aed5d8f
 +				network_port.s = dp + 1;
 +				network_port.len = _v[col].val.str_val.s + _v[col].val.str_val.len - network_port.s;
 +			} else {
-+				LM_INFO("Null socket -> can not get the network IP and port\n");
++				LM_DBG("Null socket -> can not get the network IP and port\n");
 +			}
 +		} else if (!received.len && strncmp(_k[col]->s, "received", 8) == 0) {
 +			if (!_v[col].nul) {
 +				received = _v[col].val.str_val;
 +			} else {
-+				LM_INFO("NULL received - construct from contact\n");
++				LM_DBG("NULL received - construct from contact\n");
 +			}
 +		}
 +	}
@@ -2507,13 +2543,13 @@ index 0000000..aed5d8f
 +			received.len = sprintf(received.s, "sip:%.*s:%.*s",
 +					uri.host.len, uri.host.s, port.len, port.s);
 +		}
-+		LM_INFO("Constructed received [%.*s]\n", received.len, received.s);
++		LM_DBG("Constructed received [%.*s]\n", received.len, received.s);
 +	}
 +
-+	LM_INFO("user = [%.*s]\n", user.len, user.s);
-+	LM_INFO("host = [%.*s]\n", host.len, host.s);
-+	LM_INFO("contact = [%.*s]\n", contact.len, contact.s);
-+	LM_INFO("received = [%.*s]\n", received.len, received.s);
++	LM_DBG("user = [%.*s]\n", user.len, user.s);
++	LM_DBG("host = [%.*s]\n", host.len, host.s);
++	LM_DBG("contact = [%.*s]\n", contact.len, contact.s);
++	LM_DBG("received = [%.*s]\n", received.len, received.s);
 +
 +	/* take fs_path either from the module parameter or construct is as
 +	 * IP:PORT where the message was received */	
@@ -2524,7 +2560,7 @@ index 0000000..aed5d8f
 +		fs_path.len = sprintf(fs_path.s, "%.*s:%.*s", network_ip.len, network_ip.s,
 +				network_port.len, network_port.s );
 +	}
-+	LM_INFO("fs_path = [%.*s]\n", fs_path.len, fs_path.s);
++	LM_DBG("fs_path = [%.*s]\n", fs_path.len, fs_path.s);
 +
 +/*
 + * {"Network-Port":"5065","Network-IP":"178.79.172.28","FreeSWITCH-Nodename":"freeswitch@kazoo2.anca-kazoo.com","FreeSWITCH-Hostname":"kazoo2.anca-kazoo.com","RPid":"unknown","To-Host":"sip.anca-kazoo.com","To-User":"twinkle","From-Host":"sip.anca-kazoo.com","From-User":"twinkle","Presence-Hosts":"n/a","Profile-Name":"sipinterface_1","Call-ID":"msbmplhjhlbrtrg@anca-vaio","User-Agent":"Twinkle/1.4.2","Status":"Registered(UDP)","Realm":"sip.anca-kazoo.com","Username":"twinkle","Expires":"3600","Contact":"\"anca\" <sip:twinkle@109.103.86.242:62038;fs_path=<sip:178.79.172.28:5065;lr;received='sip:109.103.86.242:62038'>>","Event-Timestamp":63534134448,"Server-ID":"","Node":"ecallmgr@kazoo2.anca-kazoo.com","Msg-ID":"75535250c50683a1056811c0931c4915","App-Version":"0.8.0","App-Name":"ecallmgr","Event-Name":"reg_success","Event-Category":"directory"}
@@ -2596,10 +2632,10 @@ index 0000000..aed5d8f
 +		return -1;
 +	}
 +
-+	LM_INFO("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
-+	LM_INFO("AMQP: channel %d\n", rconn->channel);
-+	LM_INFO("AMQP: routing key [%.*s]\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
-+	LM_INFO("AMQP: body: %s\n", messagebody);
++	LM_DBG("AMQP: exchange [%.*s]\n", (int)rconn->exchange.len, (char*)rconn->exchange.bytes);
++	LM_DBG("AMQP: channel %d\n", rconn->channel);
++	LM_DBG("AMQP: routing key [%.*s]\n", (int)amqp_rk.len, (char*)amqp_rk.bytes);
++	LM_DBG("AMQP: body: %s\n", messagebody);
 +	
 +	/*
 +		publish
@@ -2624,7 +2660,7 @@ index 0000000..aed5d8f
 +		goto error;
 +	}
 +
-+	LM_INFO("Published with success\n");
++	LM_DBG("Published with success\n");
 +	return 0;
 +
 +error:
@@ -2638,14 +2674,14 @@ index 0000000..aed5d8f
 +		LM_ERR("invalid parameter value\n");
 +		return -1;
 +	}
-+	LM_INFO("insert into table=%s\n", _h->table->s);
++	LM_DBG("insert into table=%s\n", _h->table->s);
 +	
 +	if(strncmp(_h->table->s, "location", _h->table->len)  == 0) {
 +		return amqp_register_notice(_h, _k, _v, _n);
 +	} else if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
 +		return dbk_presence_subscribe_new(_h, _k, _v, _n);
 +	} else {
-+		LM_INFO("Not supported\n");
++		LM_DBG("Not supported\n");
 +		return 0;
 +	}
 +}
@@ -2658,13 +2694,13 @@ index 0000000..aed5d8f
 +		LM_ERR("invalid parameter value\n");
 +		return -1;
 +	}
-+	LM_INFO("insert into table=%s\n", _h->table->s);
++	LM_DBG("insert into table=%s\n", _h->table->s);
 +	
 +	if(strncmp(_h->table->s, "dialoginfo", _h->table->len)  == 0) {
-+		LM_INFO("Insert update called for dialoginfo table\n");
++		LM_DBG("Insert update called for dialoginfo table\n");
 +		return dbk_dialoginfo_update(_h, _k, _v, _n);
 +	} else {
-+		LM_INFO("Not supported\n");
++		LM_DBG("Not supported\n");
 +		return 0;
 +	}
 +}
@@ -2673,10 +2709,10 @@ index 0000000..aed5d8f
 +				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
 +				const int _n, const int _un) {
 +	if(strncmp(_h->table->s, "active_watchers", _h->table->len)  == 0) {
-+		LM_INFO("Update called for active_watchers table\n");
++		LM_DBG("Update called for active_watchers table\n");
 +		return dbk_presence_subscribe_update(_h, _k, _v, _uk, _uv, _n, _un);
 +	} else {
-+		LM_INFO("Not supported\n");
++		LM_DBG("Not supported\n");
 +		return 0;
 +	}
 +}
@@ -2812,10 +2848,25 @@ index a24ac19..f7ef155 100644
  
  int bind_presence(presence_api_t* api);
 diff --git a/modules/presence/notify.c b/modules/presence/notify.c
-index d06fa6c..09e195c 100644
+index d06fa6c..58f71d6 100644
 --- a/modules/presence/notify.c
 +++ b/modules/presence/notify.c
-@@ -3011,3 +3011,85 @@ void pres_timer_send_notify(unsigned int ticks, void *param)
+@@ -1541,6 +1541,14 @@ int send_notify_request(subs_t* subs, subs_t * watcher_subs,
+ 						notify_body= final_body;
+ 					}
+ 				}
++				if (notify_body && subs->event->aux_body_processing) {
++					final_body = subs->event->aux_body_processing(subs, notify_body);
++					if(final_body) {
++						xmlFree(notify_body->s);
++						pkg_free(notify_body);
++						notify_body= final_body;
++					}
++				}
+ 			}
+ 		}
+ 	}
+@@ -3011,3 +3019,89 @@ void pres_timer_send_notify(unsigned int ticks, void *param)
  		return;
  	}
  }
@@ -2833,22 +2884,24 @@ index d06fa6c..09e195c 100644
 +
 +	memset(&m_ev, 0, sizeof(event_t));
 +
++        LM_INFO("pres_notify_watchers %s %s %s\n", pres_uri->s, event_str->s, body->s);
++
 +	if (event_parser(event_str->s, event_str->len, &m_ev) < 0) {
 +		LM_ERR("failed to parse event\n");
 +		return -1;
 +	}
++
 +	event= search_event(&m_ev);
 +	if(event== NULL) {
 +		LM_ERR("Event not supported\n");
 +		return -1;
 +	}
-+
 +	if (parse_uri(pres_uri->s, pres_uri->len, &uri) < 0) {
 +		LM_ERR("Wrong formated uri\n");
 +		return -1;
 +	}
 +	user = uri.user;
-+	domain = uri.host; 
++	domain = uri.host;
 +
 +	subs_array= get_subs_dialog(pres_uri, event , NULL);
 +	if(subs_array == NULL)
@@ -2874,8 +2927,9 @@ index d06fa6c..09e195c 100644
 +	{
 +		if (event->aux_body_processing) {
 +			LM_INFO("aux_body_processing defined\n");
-+			aux_body = event->aux_body_processing(s, notify_body?notify_body:body);
-+			LM_INFO("After auxiliary processing the body is [%.*s]\n", aux_body->len, aux_body->s);
++		      aux_body = event->aux_body_processing(s, notify_body?notify_body:body);
++//			LM_INFO("After auxiliary processing the body is [%.*s]\n", aux_body->len, aux_body->s);
++			LM_INFO("After auxiliary processing the body is [%.*s]\n", body->len, body->s);
 +		}
 +
 +
@@ -2893,6 +2947,7 @@ index d06fa6c..09e195c 100644
 +		}
 +		s= s->next;
 +	}
++
 +	ret_code= 0;
 +
 +done:
@@ -2978,19 +3033,6 @@ index ed7f4d1..ebefb4e 100644
  /*! \brief
   *  mi cmd: refreshWatchers
   *			\<presentity_uri> 
-diff --git a/modules/presence/subscribe.c b/modules/presence/subscribe.c
-index aff55f3..9946ca1 100644
---- a/modules/presence/subscribe.c
-+++ b/modules/presence/subscribe.c
-@@ -460,6 +460,8 @@ void delete_subs(str* pres_uri, str* ev_name, str* to_tag,
- 	if(subs_dbmode != DB_ONLY)
- 	{
- 		unsigned int hash_code= core_hash(pres_uri, ev_name, shtable_size);
-+		LM_INFO("Pres_uri=[%.*s], ev_name=[%.*s] to_tag=[%.*s]\n", pres_uri->len, pres_uri->s,
-+			 ev_name->len, ev_name->s, to_tag->len, to_tag->s);
- 		if(delete_shtable(subs_htable, hash_code, *to_tag) < 0)
- 			LM_ERR("Failed to delete subscription from memory\n");
- 	}
 diff --git a/modules/presence_dialoginfo/bind_pres_dialoginfo.h b/modules/presence_dialoginfo/bind_pres_dialoginfo.h
 new file mode 100644
 index 0000000..c9174fa
@@ -3026,7 +3068,7 @@ index 0000000..c9174fa
 +
 +#endif
 diff --git a/modules/presence_dialoginfo/notify_body.c b/modules/presence_dialoginfo/notify_body.c
-index cc65efb..1a57940 100644
+index cc65efb..705a054 100644
 --- a/modules/presence_dialoginfo/notify_body.c
 +++ b/modules/presence_dialoginfo/notify_body.c
 @@ -46,7 +46,7 @@
@@ -3038,16 +3080,29 @@ index cc65efb..1a57940 100644
  extern int force_single_dialog;
  
  void free_xml_body(char* body)
-@@ -69,7 +69,7 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
+@@ -66,10 +66,13 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
+ 	LM_DBG("[pres_user]=%.*s [pres_domain]= %.*s, [n]=%d\n",
+ 			pres_user->len, pres_user->s, pres_domain->len, pres_domain->s, n);
+ 
++//	if(body_array== NULL)
++//		return NULL;
++
  	if(body_array== NULL)
- 		return NULL;
+-		return NULL;
++		n = 0;
  
 -	n_body= agregate_xmls(pres_user, pres_domain, body_array, n);
 +	n_body= agg_dialoginfo_xmls(pres_user, pres_domain, body_array, n);
  	LM_DBG("[n_body]=%p\n", n_body);
  	if(n_body) {
  		LM_DBG("[*n_body]=%.*s\n",
-@@ -86,7 +86,7 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
+@@ -81,12 +84,12 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array, int n
+ 	}
+ 
+ 	xmlCleanupParser();
+-    xmlMemoryDump();
++    	xmlMemoryDump();
+ 
  	return n_body;
  }	
  
@@ -3056,11 +3111,120 @@ index cc65efb..1a57940 100644
  {
  	int i, j= 0;
  
+@@ -95,7 +98,7 @@ str* agregate_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
+ 	xmlNsPtr   namespace = NULL;
+ 
+ 	xmlNodePtr p_root= NULL;
+-	xmlDocPtr* xml_array ;
++	xmlDocPtr* xml_array = NULL;
+ 	xmlNodePtr node = NULL;
+ 	char *state;
+ 	int winner_priority = -1, priority ;
+@@ -106,14 +109,16 @@ str* agregate_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
+ 	LM_DBG("[pres_user]=%.*s [pres_domain]= %.*s, [n]=%d\n",
+ 			pres_user->len, pres_user->s, pres_domain->len, pres_domain->s, n);
+ 
+-	xml_array = (xmlDocPtr*)pkg_malloc( n*sizeof(xmlDocPtr));
+-	if(xml_array== NULL)
++	if (n) 
+ 	{
+-		LM_ERR("while allocating memory");
+-		return NULL;
++		xml_array = (xmlDocPtr*)pkg_malloc( n*sizeof(xmlDocPtr));
++		if(xml_array== NULL)
++		{
++			LM_ERR("while allocating memory");
++			return NULL;
++		}
++		memset(xml_array, 0, n*sizeof(xmlDocPtr)) ;
+ 	}
+-	memset(xml_array, 0, n*sizeof(xmlDocPtr)) ;
+-
+ 	/* parse all the XML documents */
+ 	for(i=0; i<n; i++)
+ 	{
+@@ -134,12 +139,14 @@ str* agregate_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
+ 
+ 	} 
+ 
+-	if(j== 0)  /* no body */
+-	{
+-		if(xml_array)
+-			pkg_free(xml_array);
+-		return NULL;
+-	}
++	/*
++        if(j== 0)
++        {
++        	if(xml_array)
++        		pkg_free(xml_array);
++         		return NULL;
++        }
++	*/
+ 
+ 	/* n: number of bodies in total */
+ 	/* j: number of useful bodies; created XML structures */
+@@ -181,7 +188,7 @@ str* agregate_xmls(str* pres_user, str* pres_domain, str** body_array, int n)
+ 	   use signed int as presence module stores "version" in DB as
+ 	   signed int) has max. 10 characters + 1 character for the sign
+ 	*/
+-    xmlNewProp(root_node, BAD_CAST "version", BAD_CAST "00000000000");
++    xmlNewProp(root_node, BAD_CAST "version", BAD_CAST VERSION_PH);
+     xmlNewProp(root_node, BAD_CAST  "state",  BAD_CAST "full" );
+     xmlNewProp(root_node, BAD_CAST "entity",  BAD_CAST buf);
+ 
+@@ -297,7 +304,6 @@ int get_dialog_state_priority(char *state) {
+ 
+ str *dlginfo_body_setversion(subs_t *subs, str *body) {
+ 	char *version_start=0;
+-	char version[MAX_INT_LEN + 2]; /* +2 becasue of trailing " and \0 */
+ 	int version_len;
+ 
+ 	if (!body) {
+@@ -319,21 +325,16 @@ str *dlginfo_body_setversion(subs_t *subs, str *body) {
+ 
+ 	/* safety check for placeholder - if it is body not set by the module,
+ 	 * don't update the version */
+-	if(strncmp(version_start, "00000000000\"", 12)!=0)
++	if(strncmp(version_start, VERSION_PH, VERSION_PH_LEN)!=0)
+ 		return NULL;
+ 
+-	version_len = snprintf(version, MAX_INT_LEN + 2,"%d\"", subs->version);
+-	if (version_len >= MAX_INT_LEN + 2) {
+-		LM_ERR("failed to convert 'version' to string\n");
+-		memcpy(version_start, "00000000000\"", 12);
+-		return NULL;
+-	}
+-	/* Replace the placeholder 00000000000 with the version.
++	/* Replace the placeholder 0000000000 with the version.
+ 	 * Put the padding behind the ""
+ 	 */
+-	LM_DBG("replace version with \"%s\n",version);
+-	memcpy(version_start, version, version_len);
+-	memset(version_start + version_len, ' ', 12 - version_len);
+ 
++	version_len = sprintf(version_start, "%d\"", subs->version);
++	memset(version_start + version_len, ' ', VERSION_PH_LEN +1 - version_len);
++
++	LM_DBG("Replaced the version with \"%.*s\n",version_len-1, version_start);
+ 	return NULL;
+ }
 diff --git a/modules/presence_dialoginfo/notify_body.h b/modules/presence_dialoginfo/notify_body.h
-index 838ddfe..ae0d597 100644
+index 838ddfe..42650e8 100644
 --- a/modules/presence_dialoginfo/notify_body.h
 +++ b/modules/presence_dialoginfo/notify_body.h
-@@ -42,5 +42,6 @@ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array,
+@@ -37,10 +37,17 @@
+ #ifndef _NBODY_H_
+ #define _NBODY_H_
+ 
++#include "../../str.h"
++#include "../presence/subscribe.h"
++
++#define VERSION_PH "0000000000"
++#define VERSION_PH_LEN sizeof(VERSION_PH) - 1
++
+ str* dlginfo_agg_nbody(str* pres_user, str* pres_domain, str** body_array,
+ 		int n, int off_index);
  str* dlginfo_body_setversion(subs_t *subs, str* body);
  void free_xml_body(char* body);
  int get_dialog_state_priority(char *state);
@@ -3171,10 +3335,18 @@ index 0000000..0a8e852
 +
 +#endif
 diff --git a/modules/pua_dialoginfo/dialog_publish.c b/modules/pua_dialoginfo/dialog_publish.c
-index 95b6cb3..843bd59 100644
+index 95b6cb3..c6d92c4 100644
 --- a/modules/pua_dialoginfo/dialog_publish.c
 +++ b/modules/pua_dialoginfo/dialog_publish.c
-@@ -57,7 +57,7 @@ void print_publ(publ_info_t* p)
+@@ -37,6 +37,7 @@
+ #include "../usrloc/usrloc.h"
+ #include "../usrloc/ul_callback.h"
+ #include "../../modules/tm/tm_load.h"
++#include "../../modules/presence_dialoginfo/notify_body.h"
+ #include "../pua/pua.h"
+ #include "pua_dialoginfo.h"
+ 
+@@ -57,7 +58,7 @@ void print_publ(publ_info_t* p)
  
  str* build_dialoginfo(char *state, str *entity, str *peer, str *callid, 
  	unsigned int initiator, str *localtag, str *remotetag,
@@ -3183,21 +3355,21 @@ index 95b6cb3..843bd59 100644
  {
  	xmlDocPtr  doc = NULL; 
  	xmlNodePtr root_node = NULL;
-@@ -91,8 +91,11 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+@@ -91,8 +92,11 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
  			BAD_CAST "urn:ietf:params:xml:ns:dialog-info");
  	/* we set the version to 0 but it should be set to the correct value
         in the pua module */
 -	xmlNewProp(root_node, BAD_CAST "version",
 -			BAD_CAST "0");
 +
-+    xmlNewProp(root_node, BAD_CAST "version", BAD_CAST "00000000000");
++    xmlNewProp(root_node, BAD_CAST "version", BAD_CAST VERSION_PH);
 +//	char* p = int2str(version, 0);
 +//	xmlNewProp(root_node, BAD_CAST "version",
 +//			BAD_CAST p);
  	xmlNewProp(root_node, BAD_CAST  "state",
  			BAD_CAST "full" );
  	xmlNewProp(root_node, BAD_CAST "entity", 
-@@ -260,6 +263,76 @@ error:
+@@ -260,6 +264,76 @@ error:
  	return NULL;
  }	
  
@@ -3274,7 +3446,7 @@ index 95b6cb3..843bd59 100644
  void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
  	unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
  	str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck)
-@@ -290,7 +363,7 @@ void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
+@@ -290,7 +364,7 @@ void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
  	content_type.s= "application/dialog-info+xml";
  	content_type.len= 27;
  
@@ -3283,7 +3455,7 @@ index 95b6cb3..843bd59 100644
  	if(body == NULL || body->s == NULL)
  		goto error;
  	
-@@ -377,14 +450,18 @@ error:
+@@ -377,14 +451,18 @@ error:
  }
  
  
