@@ -1,15 +1,18 @@
-From 57a737d4212211b728a67f096293375076c86e48 Mon Sep 17 00:00:00 2001
+From 861e4c743af922e7c71742405574255393f23413 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Mon, 22 Jul 2013 18:14:03 -0400
-Subject: [PATCH] Ancas cleanup of Karls hacks
+Subject: [PATCH] allow ignoring tcp port when checking the dispatcher list, fix blf q name, other amqp tweaks
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1513 ++++++++++++++++++++
- modules/db_kazoo/blf.h                             |   24 +
+ modules/db_kazoo/blf.c                             | 1515 ++++++++++++++++++++
+ modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
- modules/db_kazoo/dbase.c                           |  893 ++++++++++++
- modules/db_kazoo/dbase.h                           |   90 ++
+ modules/db_kazoo/dbase.c                           |  945 ++++++++++++
+ modules/db_kazoo/dbase.h                           |   93 ++
+ modules/dispatcher/dispatch.c                      |    8 +-
+ modules/dispatcher/dispatch.h                      |    1 +
+ modules/dispatcher/dispatcher.c                    |   10 +
  modules/presence/bind_presence.c                   |    2 +
  modules/presence/bind_presence.h                   |    3 +
  modules/presence/notify.c                          |   94 ++
@@ -22,12 +25,12 @@ Subject: [PATCH] Ancas cleanup of Karls hacks
  modules/pua/pua.c                                  |    4 +-
  modules/pua_dialoginfo/Makefile                    |    2 +
  modules/pua_dialoginfo/bind_dialoginfo.h           |   29 +
- modules/pua_dialoginfo/dialog_publish.c            |   90 ++-
+ modules/pua_dialoginfo/dialog_publish.c            |  104 ++-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 23 files changed, 3137 insertions(+), 48 deletions(-)
+ 26 files changed, 3220 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -77,10 +80,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..f7632d6
+index 0000000..2981257
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1513 @@
+@@ -0,0 +1,1515 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -134,15 +137,18 @@ index 0000000..f7632d6
 +#define BLF_JSON_MSG_ID         "Msg-ID"
 +#define BLF_JSON_DIRECTION      "Direction"
 +
-+static char blf_queue_name_buffer[128];
++// static char blf_queue_name_buffer[128];
 +static amqp_bytes_t blf_queue;
++rmq_conn_t *dpk_pres_rmqconn;
 +
 +str sht_name = str_init("$sht(dbkp=>$ci)");
 +pv_spec_t sht_spec;
 +char node_name[128];
 +
-+int dbk_initialize_presence(void)
++int dbk_initialize_presence(rmq_conn_t *rconn)
 +{
++	static amqp_bytes_t exch = {10, "dialoginfo"};
++
 +        LM_DBG("dbk_initialize_presence\n");
 +	/* bind to presence module */
 +	bind_presence_t bind_presence= (bind_presence_t)find_export("bind_presence", 1,0);
@@ -188,8 +194,45 @@ index 0000000..f7632d6
 +		return -1;
 +	}
 +
-+	blf_queue.bytes = blf_queue_name_buffer;
-+	blf_queue.len = sprintf(blf_queue.bytes, "BLF-%.*s", dbk_node_hostname.len, dbk_node_hostname.s);
++	if (rconn == NULL) {
++                LM_ERR("rmqp connection not provided\n");
++		return -1;
++	}
++
++	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("direct"),
++                              0, 0, amqp_empty_table);
++	if (rmq_error("Declaring exchange", amqp_get_rpc_reply(rconn->conn))) {
++                LM_ERR("Failed to declare dialoginfo exchange\n"); 
++		return -1;
++	}
++
++        {
++          amqp_queue_declare_ok_t *r = amqp_queue_declare(rconn->conn, rconn->channel, amqp_empty_bytes, 0, 0, 0, 1, amqp_empty_table);
++
++          if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
++                  LM_ERR("Failed to declare presence queue\n"); 
++	          return -1;
++          }
++
++          blf_queue = amqp_bytes_malloc_dup(r->queue);
++          if (blf_queue.bytes == NULL) {
++                  LM_ERR("Unable to copy presence queue name\n"); 
++	          return -1;            
++          }
++
++          LM_DBG("Create presence queue %.*s\n", (int) blf_queue.len, (char *) blf_queue.bytes);
++        }
++
++	amqp_queue_bind(rconn->conn, rconn->channel, blf_queue, exch, blf_queue, amqp_empty_table);
++	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
++                LM_ERR("Unable to bind presence queue\n"); 
++		return -1;
++	}
++
++        dpk_pres_rmqconn = rconn;
++
++        //	blf_queue.bytes = blf_queue_name_buffer;
++        //	blf_queue.len = sprintf(blf_queue.bytes, "BLF-%.*s", dbk_node_hostname.len, dbk_node_hostname.s);
 +
 +	sprintf(node_name, "kamailio@%.*s", dbk_node_hostname.len, dbk_node_hostname.s);
 +	return 0;
@@ -200,6 +243,12 @@ index 0000000..f7632d6
 +{
 +	int i;
 +        LM_DBG("dbk_start_presence_rmqp_consumer_processes\n");
++
++        if (!dpk_pres_rmqconn) {
++                LM_ERR("Unable to start presence consumer, no AMQP connection\n");
++		return;          
++        }
++
 +	for (i= 0; i< DBK_PRES_WORKERS_NO; i++) {
 +		int newpid = fork_process(PROC_NOCHLDINIT, "RMQP PRESENCE WORKER", 0);
 +		if(newpid < 0) {
@@ -224,38 +273,9 @@ index 0000000..f7632d6
 +	size_t body_target;
 +	size_t body_received = 0;
 +	char body[2048];
-+	static amqp_bytes_t exch = {10, "dialoginfo"};
-+	rmq_conn_t * rconn;
-+	
-+	LM_DBG("Start rmqp consumer\n");
-+	rconn = rmqp_new_connection(id);
-+	if (rconn == NULL) {
-+          LM_ERR("Failed to create rmqp connection\n");
-+          return;
-+	}
-+	LM_DBG("Created rmqp connection\n");
-+	/* Declare reply queue and start consumer */
-+        
-+        //	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("fanout"),
-+	amqp_exchange_declare(rconn->conn, rconn->channel, amqp_cstring_bytes("dialoginfo"), amqp_cstring_bytes("direct"),
-+                              0, 0, amqp_empty_table);
-+	if (rmq_error("Declaring exchange", amqp_get_rpc_reply(rconn->conn))) {
-+          goto error;
-+	}
 +
-+        amqp_queue_declare(rconn->conn, rconn->channel, blf_queue, 0, 0, 1, 1, amqp_empty_table);
-+        if (rmq_error("Declaring queue", amqp_get_rpc_reply(rconn->conn))) {
-+          goto error;
-+        }
-+        LM_DBG("Queue declare was successful\n");
-+
-+	amqp_queue_bind(rconn->conn, rconn->channel, blf_queue, exch, blf_queue, amqp_empty_table);
-+	if (rmq_error("Binding queue", amqp_get_rpc_reply(rconn->conn))) {
-+		goto error;
-+	}
-+
-+	amqp_basic_consume(rconn->conn, rconn->channel, blf_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
-+	if (rmq_error("Consuming", amqp_get_rpc_reply(rconn->conn))) {
++	amqp_basic_consume(dpk_pres_rmqconn->conn, dpk_pres_rmqconn->channel, blf_queue, amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
++	if (rmq_error("Consuming", amqp_get_rpc_reply(dpk_pres_rmqconn->conn))) {
 +		goto error;
 +	}
 +
@@ -263,8 +283,9 @@ index 0000000..f7632d6
 +	while (1) {
 +		LM_DBG("Wait for a packet\n");
 +		while (1) {
-+			amqp_maybe_release_buffers(rconn->conn);
-+			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			amqp_maybe_release_buffers(dpk_pres_rmqconn->conn);
++                        
++			result = amqp_simple_wait_frame(dpk_pres_rmqconn->conn, &frame);
 +			if (result < 0) {
 +				break;
 +			}
@@ -285,7 +306,7 @@ index 0000000..f7632d6
 +					(int) d->exchange.len, (char *) d->exchange.bytes,
 +					(int) d->routing_key.len, (char *) d->routing_key.bytes);
 +
-+			result = amqp_simple_wait_frame(rconn->conn, &frame);
++			result = amqp_simple_wait_frame(dpk_pres_rmqconn->conn, &frame);
 +			if (result < 0) {
 +				break;
 +			}
@@ -304,7 +325,7 @@ index 0000000..f7632d6
 +			body_received = 0;
 +
 +			while (body_received < body_target) {
-+				result = amqp_simple_wait_frame(rconn->conn, &frame);
++				result = amqp_simple_wait_frame(dpk_pres_rmqconn->conn, &frame);
 +				if (result < 0) {
 +					break;
 +				}
@@ -621,36 +642,6 @@ index 0000000..f7632d6
 +	return pres_dialoginfo_api.agg_dialoginfo(&uri.user, &uri.host, dlg_bodies_p, dlg_no);
 +}
 +
-+int dbk_phtable_dialoginfo(str* local_user)
-+{
-+        dbk_pres_user_t* pu, *pu_prev = NULL;
-+	str* body = NULL;
-+        unsigned int hash_code = core_hash(local_user, 0, dbk_phtable_size);
-+	str dlg_bodies[BLF_MAX_DIALOGS], event = str_init("dialog");
-+	int dlg_no = 0;
-+
-+        lock_get(&dbk_phtable[hash_code].lock);
-+	pu = dbk_pres_search_pu(hash_code, local_user, &pu_prev, 0);
-+        if (pu != NULL && pu->pd != NULL) {
-+        	dbk_blf_copy_bodies(pu, NULL, dlg_bodies, &dlg_no);
-+        }
-+        lock_release(&dbk_phtable[hash_code].lock);
-+
-+        body = dbk_blf_aggregate_body(local_user, dlg_bodies, dlg_no);
-+
-+        while(dlg_no) {
-+        	pkg_free(dlg_bodies[--dlg_no].s);
-+        }
-+
-+        if (presence_api.notify_watchers(local_user, &event, body) < 0) {
-+        	LM_ERR("Failed to notify watchers\n");
-+        	return -1;
-+	}
-+
-+	dbk_free_xml(body);
-+	return 0;
-+}
-+
 +str* dbk_phtable_update(str* local_user, str* remote_user, str* callid,
 +	 str* localtag, str* remotetag, str* state, int initiator)
 +{
@@ -728,7 +719,6 @@ index 0000000..f7632d6
 +			}		
 +			pd->next = pu->pd;
 +			pu->pd = pd;
-+//			pu->dlg_no++;
 +			lock_release(&dbk_phtable[hash_code].lock);
 +		} else { /* terminated */
 +			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
@@ -817,7 +807,6 @@ index 0000000..f7632d6
 +			} else {
 +				pu->pd = pd->next;
 +			}
-+//			pu->dlg_no--;
 +			lock_release(&dbk_phtable[hash_code].lock);
 +			dbk_free_pd(pd);
 +			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
@@ -906,6 +895,8 @@ index 0000000..f7632d6
 +	} else {
 +		int hash_code;
 +		dbk_pres_user_t* pu_prev = NULL;
++		str* body;
++		static str event = str_init("dialog");
 +
 +		hash_code = core_hash(user, NULL, dbk_phtable_size);
 +		lock_get(&dbk_phtable[hash_code].lock);
@@ -914,6 +905,7 @@ index 0000000..f7632d6
 +			LM_DBG("FLUSH: No record found for user %.*s\n", user->len, user->s);
 +			lock_release(&dbk_phtable[hash_code].lock);
 +		} else {
++			LM_DBG("FLUSH: Delete record for user %.*s\n", user->len, user->s);
 +			if (pu_prev) { 
 +				pu_prev->next = pu->next;
 +			} else {
@@ -922,7 +914,20 @@ index 0000000..f7632d6
 +			lock_release(&dbk_phtable[hash_code].lock);
 +			dbk_free_pu(pu);
 +		}
-+		dbk_phtable_dialoginfo(user);
++
++		
++		/* send a notify with no dialog to clear dialog state */
++		if ( (body = pua_dialoginfo_api.build_dialoginfo(0, user,
++			0, 0, 0, 0, 0, 0, 0, 0)) == NULL ) {
++			LM_ERR("Failed to construct BLF XML doc\n");
++			return -1;
++		}
++		if (presence_api.notify_watchers(user, &event, body) < 0) {
++        		LM_ERR("Failed to notify watchers\n");
++			dbk_free_xml(body);
++        		return -1;
++		}
++		dbk_free_xml(body);
 +	}
 +	return 0;
 +}
@@ -1596,17 +1601,18 @@ index 0000000..f7632d6
 +
 diff --git a/modules/db_kazoo/blf.h b/modules/db_kazoo/blf.h
 new file mode 100644
-index 0000000..1307887
+index 0000000..6a69328
 --- /dev/null
 +++ b/modules/db_kazoo/blf.h
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,25 @@
 +#ifndef _DBK_BLF_
 +#define _DBK_BLF_
 +
 +#include "../../lib/srdb1/db_id.h"
 +#include "../../mi/mi_types.h"
++#include "dbase.h"
 +
-+int dbk_initialize_presence(void);
++int dbk_initialize_presence(rmq_conn_t* rconn);
 +void dbk_start_presence_rmqp_consumer_processes(struct db_id* id);
 +void dbk_destroy_presence(void);
 +int dbk_presence_query(const db1_con_t* _h, const db_key_t* _k,
@@ -1819,10 +1825,10 @@ index 0000000..627ae7e
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..efc381f
+index 0000000..661e8f5
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
-@@ -0,0 +1,893 @@
+@@ -0,0 +1,945 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -1867,8 +1873,6 @@ index 0000000..efc381f
 +	int db_len = strlen(id->database);
 +	int size = sizeof(rmq_conn_t) + db_len;
 +
-+
-+	LM_DBG("db_kazoo_new_connection\n");
 +	rmq = (rmq_conn_t*)pkg_malloc(size);
 +	if (!rmq) {
 +		LM_ERR("No more private memory\n");
@@ -1883,13 +1887,11 @@ index 0000000..efc381f
 +	memcpy(rmq->exchange.bytes, id->database, db_len);
 +	rmq->exchange.len = db_len;
 +
-+
-+	LM_DBG("Created rmq structure %p\n", rmq);
++	LM_DBG("Created new rmq structure %p for %s\n", rmq, id->database);
 +	if (!(rmq->conn = amqp_new_connection())) {
 +		LM_ERR("cannot create new connection\n");
 +		goto error;
 +	}
-+	LM_DBG("RMQP new connection successfull!\n");
 +
 +	rmq->socket = amqp_tcp_socket_new();
 +	if (!rmq->socket) {
@@ -1902,11 +1904,8 @@ index 0000000..efc381f
 +		LM_ERR("Failed to open TCP socket\n");
 +		goto error;
 +	}
-+	LM_DBG("RMQP open socket successfull!\n");
 +
-+	amqp_set_socket(rmq->conn, rmq->socket);
-+
-+	LM_DBG("RMQP set socket successfull!\n");
++       	amqp_set_socket(rmq->conn, rmq->socket);
 +
 +	if ( rmq_error("Logging in", amqp_login(rmq->conn,
 +			"/",
@@ -1916,16 +1915,16 @@ index 0000000..efc381f
 +			AMQP_SASL_METHOD_PLAIN,
 +			id->username,
 +			id->password)) ) {
++                LM_ERR("RMQP failed to login!\n");
 +		goto error;
 +	}
-+	LM_DBG("RMQP login successfull!\n");
 +
-+	rmq->channel = process_no;
++	rmq->channel = process_no + 1;
 +	amqp_channel_open(rmq->conn, rmq->channel);
 +	if (rmq_error("Opening channel", amqp_get_rpc_reply(rmq->conn))) {
++                LM_ERR("RMQP failed to open channel %d!\n", rmq->channel);
 +		goto error;
 +	}
-+	LM_DBG("Created channel %d\n", rmq->channel);
 +
 +	return rmq;
 +
@@ -1958,14 +1957,24 @@ index 0000000..efc381f
 +			LM_DBG("Process no = %d\n", process_no);
 +			if (process_no == 0 ) {
 +				if (!presence_initialized) { /* called from mod_init before any fork */
++                                        rmq_conn_t *rconn = rmqp_new_connection(id);
++                                        if (rconn == NULL) {
++                                               LM_ERR("Failed to create rmqp connection for presence\n");
++                                               return NULL;
++                                        }
++
 +					LM_DBG("Initialize presence\n");
-+					if(dbk_initialize_presence() < 0) {
++
++					if(dbk_initialize_presence(rconn) < 0) {
 +						LM_ERR("Failed to initialize db_kazoo for presence");
 +						return NULL;
 +					}
 +					presence_initialized = 1;
++
++                                        return rconn;
 +				}
-+				return dbk_dummy_db_conn(id);
++
++                                return dbk_dummy_db_conn(id);
 +			} else if (process_no == 1) { /* called from child_init */
 +				LM_DBG("Start presence rmqp consumer processes\n");
 +				dbk_start_presence_rmqp_consumer_processes(id);
@@ -2292,9 +2301,11 @@ index 0000000..efc381f
 +	char body[2048];
 +
 +	while (1) {
-+		LM_DBG("Before amqp_maybe_release_buffers\n");
 +		amqp_maybe_release_buffers(rconn->conn);
-+		LM_DBG("After amqp_maybe_release_buffers\n");
++		if (dbk_rmq_wait_for_data(rconn->conn) < 0 ) {
++			LM_ERR("RMQ data not ready - give up\n");
++			goto error;
++		}
 +		result = amqp_simple_wait_frame(rconn->conn, &frame);
 +		LM_DBG("Result: %d\n", result);
 +		if (result < 0) {
@@ -2317,6 +2328,10 @@ index 0000000..efc381f
 +				(int) d->exchange.len, (char *) d->exchange.bytes,
 +				(int) d->routing_key.len, (char *) d->routing_key.bytes);
 +
++		if (dbk_rmq_wait_for_data(rconn->conn) < 0 ) {
++			LM_ERR("RMQ data not ready - give up\n");
++			goto error;
++		}
 +		result = amqp_simple_wait_frame(rconn->conn, &frame);
 +		if (result < 0) {
 +			break;
@@ -2337,6 +2352,10 @@ index 0000000..efc381f
 +		body_received = 0;
 +
 +		while (body_received < body_target) {
++			if (dbk_rmq_wait_for_data(rconn->conn) < 0 ) {
++				LM_ERR("RMQ data not ready - give up\n");
++				goto error;
++			}
 +			result = amqp_simple_wait_frame(rconn->conn, &frame);
 +			if (result < 0) {
 +				break;
@@ -2716,12 +2735,51 @@ index 0000000..efc381f
 +		return 0;
 +	}
 +}
++
++#define RCV_TIMEOUT 3         // seconds
++
++int dbk_rmq_wait_for_data(amqp_connection_state_t conn)
++{
++        struct timeval timeout;
++        int sock;
++        fd_set read_flags;
++        int ret;
++
++        if (amqp_data_in_buffer(conn)  || amqp_frames_enqueued(conn) ) {
++            return 0;
++        }
++
++        sock = amqp_get_sockfd(conn);
++        FD_ZERO(&read_flags);
++        FD_SET(sock, &read_flags);
++
++        timeout.tv_sec = RCV_TIMEOUT;
++        timeout.tv_usec = 0;
++
++        ret = select(sock+1, &read_flags, NULL, NULL, &timeout);
++        if (ret == -1) {
++            LM_ERR("select: %s\n", strerror(errno));
++            return -1;
++        }
++        else if (ret == 0) {
++            LM_INFO("select: timeout\n");
++            return -1;
++        }
++        if (FD_ISSET(sock, &read_flags)) {
++            LM_INFO("select: data received\n");
++        }
++
++        return 0;
++}
++
++
++
 diff --git a/modules/db_kazoo/dbase.h b/modules/db_kazoo/dbase.h
 new file mode 100644
-index 0000000..75f618e
+index 0000000..9c523f1
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,93 @@
 +#ifndef _DB_KAZOO_DBASE_
 +#define _DB_KAZOO_DBASE_
 +
@@ -2811,7 +2869,90 @@ index 0000000..75f618e
 +int db_kazoo_update (const db1_con_t* _h, const db_key_t* _k, const db_op_t* _o,
 +				const db_val_t* _v, const db_key_t* _uk, const db_val_t* _uv,
 +				const int _n, const int _un);
++
++int dbk_rmq_wait_for_data(amqp_connection_state_t conn);
++
 +#endif
+diff --git a/modules/dispatcher/dispatch.c b/modules/dispatcher/dispatch.c
+index cc8b7bf..64b2f22 100644
+--- a/modules/dispatcher/dispatch.c
++++ b/modules/dispatcher/dispatch.c
+@@ -2213,7 +2213,7 @@ int ds_print_list(FILE *fout)
+ /* Checks, if the request (sip_msg *_m) comes from a host in a group
+  * (group-id or -1 for all groups)
+  */
+-int ds_is_from_list(struct sip_msg *_m, int group)
++int ds_is_from_list_no_port(struct sip_msg *_m, int group, int ignore_port)
+ {
+ 	pv_value_t val;
+ 	ds_set_t *list;
+@@ -2231,7 +2231,7 @@ int ds_is_from_list(struct sip_msg *_m, int group)
+ 			{
+ 				// LM_ERR("port no: %d (%d)\n", list->dlist[j].port, j);
+ 				if (ip_addr_cmp(&_m->rcv.src_ip, &list->dlist[j].ip_address)
+-						&& (list->dlist[j].port==0
++						&& (ignore_port || list->dlist[j].port==0
+ 							|| _m->rcv.src_port == list->dlist[j].port))
+ 				{
+ 					if(group==-1 && ds_setid_pvname.s!=0)
+@@ -2252,6 +2252,10 @@ int ds_is_from_list(struct sip_msg *_m, int group)
+ 	return -1;
+ }
+ 
++int ds_is_from_list(struct sip_msg *_m, int group)
++{
++	return ds_is_from_list_no_port(_m, group, 0);
++}
+ 
+ int ds_print_mi_list(struct mi_node* rpl)
+ {
+diff --git a/modules/dispatcher/dispatch.h b/modules/dispatcher/dispatch.h
+index db055ee..4ab755f 100644
+--- a/modules/dispatcher/dispatch.h
++++ b/modules/dispatcher/dispatch.h
+@@ -119,6 +119,7 @@ int ds_load_update(struct sip_msg *msg);
+ int ds_hash_load_init(unsigned int htsize, int expire, int initexpire);
+ int ds_hash_load_destroy(void);
+ 
++int ds_is_from_list_no_port(struct sip_msg *_m, int group, int ignore_port);
+ int ds_is_from_list(struct sip_msg *_m, int group);
+ /*! \brief
+  * Timer for checking inactive destinations
+diff --git a/modules/dispatcher/dispatcher.c b/modules/dispatcher/dispatcher.c
+index cf79d90..722d3db 100644
+--- a/modules/dispatcher/dispatcher.c
++++ b/modules/dispatcher/dispatcher.c
+@@ -155,6 +155,7 @@ static int w_ds_load_update(struct sip_msg*, char*, char*);
+ 
+ static int w_ds_is_from_list0(struct sip_msg*, char*, char*);
+ static int w_ds_is_from_list1(struct sip_msg*, char*, char*);
++static int w_ds_is_from_list2(struct sip_msg *msg, char *set, char *ignore_port);
+ 
+ static void destroy(void);
+ 
+@@ -182,6 +183,8 @@ static cmd_export_t cmds[]={
+ 		0, 0, REQUEST_ROUTE|FAILURE_ROUTE|ONREPLY_ROUTE|BRANCH_ROUTE},
+ 	{"ds_is_from_list",  (cmd_function)w_ds_is_from_list1, 1,
+ 		fixup_uint_null, 0, ANY_ROUTE},
++	{"ds_is_from_list",  (cmd_function)w_ds_is_from_list2, 2,
++		fixup_uint_uint, 0, ANY_ROUTE},
+ 	{"ds_load_unset",    (cmd_function)w_ds_load_unset,   0,
+ 		0, 0, ANY_ROUTE},
+ 	{"ds_load_update",   (cmd_function)w_ds_load_update,  0,
+@@ -794,6 +797,13 @@ static int w_ds_is_from_list1(struct sip_msg *msg, char *set, char *str2)
+ 	return ds_is_from_list(msg, (int)(long)set);
+ }
+ 
++static int w_ds_is_from_list2(struct sip_msg *msg, char *set, char *ignore_port)
++{
++	return ds_is_from_list_no_port(msg, (int)(long)set, (int)(long)ignore_port);
++}
++
++
++
+ static int ds_parse_reply_codes() {
+ 	param_t* params_list = NULL;
+ 	param_t *pit=NULL;
 diff --git a/modules/presence/bind_presence.c b/modules/presence/bind_presence.c
 index 2392a81..6e518e4 100644
 --- a/modules/presence/bind_presence.c
@@ -3335,7 +3476,7 @@ index 0000000..0a8e852
 +
 +#endif
 diff --git a/modules/pua_dialoginfo/dialog_publish.c b/modules/pua_dialoginfo/dialog_publish.c
-index 95b6cb3..c6d92c4 100644
+index 95b6cb3..2a769dc 100644
 --- a/modules/pua_dialoginfo/dialog_publish.c
 +++ b/modules/pua_dialoginfo/dialog_publish.c
 @@ -37,6 +37,7 @@
@@ -3355,21 +3496,83 @@ index 95b6cb3..c6d92c4 100644
  {
  	xmlDocPtr  doc = NULL; 
  	xmlNodePtr root_node = NULL;
-@@ -91,8 +92,11 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+@@ -73,7 +74,7 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 		LM_ERR("entity URI '%.*s' too long, maximum=%d\n",entity->len, entity->s, MAX_URI_SIZE);
+ 		return NULL;
+ 	}
+-    memcpy(buf, entity->s, entity->len);
++	memcpy(buf, entity->s, entity->len);
+ 	buf[entity->len]= '\0';
+ 
+ 	/* create the Publish body  */
+@@ -81,23 +82,27 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 	if(doc==0)
+ 		return NULL;
+ 
+-    root_node = xmlNewNode(NULL, BAD_CAST "dialog-info");
++	root_node = xmlNewNode(NULL, BAD_CAST "dialog-info");
+ 	if(root_node==0)
+ 		goto error;
+     
+ 	xmlDocSetRootElement(doc, root_node);
+ 
+-    xmlNewProp(root_node, BAD_CAST "xmlns",
++	xmlNewProp(root_node, BAD_CAST "xmlns",
  			BAD_CAST "urn:ietf:params:xml:ns:dialog-info");
  	/* we set the version to 0 but it should be set to the correct value
         in the pua module */
 -	xmlNewProp(root_node, BAD_CAST "version",
 -			BAD_CAST "0");
 +
-+    xmlNewProp(root_node, BAD_CAST "version", BAD_CAST VERSION_PH);
-+//	char* p = int2str(version, 0);
-+//	xmlNewProp(root_node, BAD_CAST "version",
-+//			BAD_CAST p);
++	xmlNewProp(root_node, BAD_CAST "version", BAD_CAST VERSION_PH);
  	xmlNewProp(root_node, BAD_CAST  "state",
  			BAD_CAST "full" );
  	xmlNewProp(root_node, BAD_CAST "entity", 
-@@ -260,6 +264,76 @@ error:
+ 			BAD_CAST buf);
+ 
++	if (!callid) {
++		LM_DBG("Empty dialog-info\n");
++		goto done;
++	}
+ 	/* RFC 3245 differs between id and call-id. For example if a call
+ 	   is forked and 2 early dialogs are established, we should send 2
+ 	    PUBLISH requests, both have the same call-id but different id.
+@@ -119,7 +124,7 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 		LM_ERR("call-id '%.*s' too long, maximum=%d\n", callid->len, callid->s, MAX_URI_SIZE);
+ 		return NULL;
+ 	}
+-    memcpy(buf, callid->s, callid->len);
++	memcpy(buf, callid->s, callid->len);
+ 	buf[callid->len]= '\0';
+ 
+ 	xmlNewProp(dialog_node, BAD_CAST "id", BAD_CAST buf);
+@@ -174,7 +179,7 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 			LM_ERR("peer '%.*s' too long, maximum=%d\n", peer->len, peer->s, MAX_URI_SIZE);
+ 			return NULL;
+ 		}
+-    	memcpy(buf, peer->s, peer->len);
++		memcpy(buf, peer->s, peer->len);
+ 		buf[peer->len]= '\0';
+ 
+ 		tag_node = xmlNewChild(remote_node, NULL, BAD_CAST "identity", BAD_CAST buf) ;
+@@ -207,7 +212,7 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 			LM_ERR("entity '%.*s' too long, maximum=%d\n", entity->len, entity->s, MAX_URI_SIZE);
+ 			return NULL;
+ 		}
+-    	memcpy(buf, entity->s, entity->len);
++		memcpy(buf, entity->s, entity->len);
+ 		buf[entity->len]= '\0';
+ 
+ 		tag_node = xmlNewChild(local_node, NULL, BAD_CAST "identity", BAD_CAST buf) ;
+@@ -229,6 +234,7 @@ str* build_dialoginfo(char *state, str *entity, str *peer, str *callid,
+ 		xmlNewProp(tag_node, BAD_CAST "uri", BAD_CAST buf);
+ 	}
+ 
++done:
+ 	/* create the body */
+ 	body = (str*)pkg_malloc(sizeof(str));
+ 	if(body == NULL)
+@@ -260,6 +266,76 @@ error:
  	return NULL;
  }	
  
@@ -3446,7 +3649,7 @@ index 95b6cb3..c6d92c4 100644
  void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
  	unsigned int initiator, unsigned int lifetime, str *localtag, str *remotetag,
  	str *localtarget, str *remotetarget, unsigned short do_pubruri_localcheck)
-@@ -290,7 +364,7 @@ void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
+@@ -290,7 +366,7 @@ void dialog_publish(char *state, str* ruri, str *entity, str *peer, str *callid,
  	content_type.s= "application/dialog-info+xml";
  	content_type.len= 27;
  
@@ -3455,7 +3658,7 @@ index 95b6cb3..c6d92c4 100644
  	if(body == NULL || body->s == NULL)
  		goto error;
  	
-@@ -377,14 +451,18 @@ error:
+@@ -377,14 +453,18 @@ error:
  }
  
  
