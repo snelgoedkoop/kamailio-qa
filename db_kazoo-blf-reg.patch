@@ -1,8 +1,9 @@
-From 2269033a8184f665a4253739a52e2a9b3dd4e89f Mon Sep 17 00:00:00 2001
+From 4dd55270cea51df40e5b4682d2fbd0ee5825beb7 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Fri, 9 Aug 2013 11:40:34 -0700
 Subject: [PATCH] tweaks to the log lines
 
+fix bugs
 ---
  modules/db_kazoo/Makefile                          |   32 +
  modules/db_kazoo/blf.c                             | 1550 ++++++++++++++++++++
@@ -80,7 +81,7 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..3cd4145
+index 0000000..fe2989c
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
 @@ -0,0 +1,1550 @@
@@ -655,10 +656,10 @@ index 0000000..3cd4145
 +	int i;
 +
 +        LM_INFO("Update dbk phtable: %.*s %.*s %.*s %.*s"
-+                ,local_user->s, local_user->len
-+                ,remote_user->s, remote_user->len
-+                ,callid->s, callid->len
-+                ,state->s, state->len);
++                ,local_user->len, local_user->s
++                ,remote_user->len, remote_user->s
++                ,callid->len, callid->s
++                ,state->len, state->s);
 +
 +	if (terminated) {
 +		LM_DBG("Updated to terminated state\n");
@@ -672,8 +673,8 @@ index 0000000..3cd4145
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		if (!terminated) {		
 +                        LM_INFO("No record found for %.*s/%.*s, created a new one\n"
-+                                ,local_user->s, local_user->len
-+                                ,remote_user->s, remote_user->len);
++                                ,local_user->len, local_user->s
++                                ,remote_user->len, remote_user->s);
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
 +				LM_ERR("Failed to construct BLF XML doc\n");
@@ -687,8 +688,8 @@ index 0000000..3cd4145
 +			return body;
 +		}
 +		LM_INFO("No record found for %.*s/%.*s and state terminated, do nothing\n"
-+                        ,local_user->s, local_user->len
-+                        ,remote_user->s, remote_user->len);
++                        ,local_user->len, local_user->s
++                        ,remote_user->len, remote_user->s);
 +		return pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +	}
@@ -705,9 +706,9 @@ index 0000000..3cd4145
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		if (!terminated) {
 +                        LM_INFO("Dialog %.*s not found for %.*s/%.*s, created a new one\n"
-+                                ,callid->s, callid->len
-+                                ,local_user->s, local_user->len
-+                                ,remote_user->s, remote_user->len);
++                                ,callid->len, callid->s
++                                ,local_user->len, local_user->s
++                                ,remote_user->len, remote_user->s);
 +			LM_DBG("Dialog record not found, insert a new one\n");
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
@@ -750,9 +751,9 @@ index 0000000..3cd4145
 +
 +	if (!terminated) {
 +                LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, update the body\n"
-+                        ,local_user->s, local_user->len
-+                        ,remote_user->s, remote_user->len
-+                        ,callid->s, callid->len);
++                        ,local_user->len, local_user->s
++                        ,remote_user->len, remote_user->s
++                        ,callid->len, callid->s);
 +		/* update only the body */
 +		lock_release(&dbk_phtable[hash_code].lock);
 +
@@ -770,7 +771,7 @@ index 0000000..3cd4145
 +		if (pu == NULL) { /* pres user deleted in the meantime (my dialog ended) */
 +			lock_release(&dbk_phtable[hash_code].lock);
 +			LM_INFO("Dialog %.*s deleted in the meantime (my dialog must have ended)\n"
-+                                ,callid->s, callid->len);
++                                ,callid->len, callid->s);
 +			dbk_free_xml(body);
 +			body = NULL;
 +			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
@@ -780,7 +781,7 @@ index 0000000..3cd4145
 +		if (pd == NULL) {
 +			lock_release(&dbk_phtable[hash_code].lock);
 +			LM_INFO("Dialog %.*s deleted in the meantime (my dialog must have ended)\n"
-+                                ,callid->s, callid->len);
++                                ,callid->len, callid->s);
 +			dbk_free_xml(body);
 +			body = NULL;
 +			goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
@@ -804,9 +805,9 @@ index 0000000..3cd4145
 +		lock_release(&dbk_phtable[hash_code].lock);
 +	} else {
 +		LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, state terminated, delete\n"
-+                        ,local_user->s, local_user->len
-+                        ,remote_user->s, remote_user->len
-+                        ,callid->s, callid->len);
++                        ,local_user->len, local_user->s
++                        ,remote_user->len, remote_user->s
++                        ,callid->len, callid->s);
 +		if (pd_prev == NULL && pd->next == NULL) { // there is no other dialog record
 +			LM_DBG("No other dialog - delete pu record\n");
 +			/* delete pu */
@@ -822,8 +823,8 @@ index 0000000..3cd4145
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +			goto ret_current_dialog;
 +		} else {
-+			LM_DBG("Other dialog for %.*s - delete pd record\n"
-+                               ,callid->s, callid->len);
++                        LM_DBG("Other dialog for %.*s - delete pd record\n"
++                               ,callid->len, callid->s);
 +			/* delete pd */
 +			if (pd_prev) {
 +				pd_prev->next = pd->next;
@@ -1074,10 +1075,10 @@ index 0000000..3cd4145
 +                }
 +
 +                LM_INFO("Received update: %.*s/%.*s %.*s %.*s"
-+                        ,from_user->s, from_user->len
-+                        ,to_user->s, to_user->len
-+                        ,callid->s, callid->len
-+                        ,state->s, state->len);
++                        ,from_user.len, from_user.s
++                        ,to_user.len, to_user.s
++                        ,callid.len, callid.s
++                        ,state.len, state.s);
 +
 +                if (ret < 0) {
 +			LM_ERR("Failed to process dialoginfo update command\n");
@@ -1167,7 +1168,7 @@ index 0000000..3cd4145
 +	pres_uri.s = pres_uri_buf;
 +	pres_uri.len = sprintf(pres_uri_buf, "sip:%.*s@%.*s", username.len, username.s, domain.len, domain.s);
 +
-+	LM_INFO("dbk presence query %s\n", username.s, domain.s, pres_uri.s);
++	LM_INFO("dbk presence query %s\n", pres_uri.s);
 +	
 +	db_res = db_new_result();
 +	if ( db_res == NULL ) {
@@ -1479,8 +1480,8 @@ index 0000000..3cd4145
 +	} 
 +
 +	LM_INFO("Subscription %.*s/%.*s expires in %d\n"
-+		,from_user.len, from_user.s
-+                ,user.len, user.s
++		,from_user->len, from_user->s
++                ,user->len, user->s
 +                ,expires-(int)time(NULL));
 +
 +	json_object_object_add(json_object, BLF_JSON_USER, json_object_new_string_len(user->s, user->len));
