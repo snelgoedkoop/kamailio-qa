@@ -1,4 +1,4 @@
-From 4dd55270cea51df40e5b4682d2fbd0ee5825beb7 Mon Sep 17 00:00:00 2001
+From 085a2e46e02d96db28f3e72851833bf8df9b6411 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Fri, 9 Aug 2013 11:40:34 -0700
 Subject: [PATCH] tweaks to the log lines
@@ -6,7 +6,7 @@ Subject: [PATCH] tweaks to the log lines
 fix bugs
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1550 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1557 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  945 ++++++++++++
@@ -31,7 +31,7 @@ fix bugs
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 26 files changed, 3255 insertions(+), 56 deletions(-)
+ 26 files changed, 3262 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -81,10 +81,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..fe2989c
+index 0000000..b0d37f4
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1550 @@
+@@ -0,0 +1,1557 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -655,12 +655,12 @@ index 0000000..fe2989c
 +	int dlg_no = 1;
 +	int i;
 +
-+        LM_INFO("Update dbk phtable: %.*s %.*s %.*s %.*s"
-+                ,local_user->len, local_user->s
-+                ,remote_user->len, remote_user->s
-+                ,callid->len, callid->s
-+                ,state->len, state->s);
-+
++        LM_DBG("Update dbk phtable: %.*s %.*s %.*s %.*s"
++               ,local_user->len, local_user->s
++               ,remote_user->len, remote_user->s
++               ,callid->len, callid->s
++               ,state->len, state->s);
++        
 +	if (terminated) {
 +		LM_DBG("Updated to terminated state\n");
 +	}
@@ -672,9 +672,10 @@ index 0000000..fe2989c
 +	if (pu == NULL) {	
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		if (!terminated) {		
-+                        LM_INFO("No record found for %.*s/%.*s, created a new one\n"
++                        LM_INFO("No record found for %.*s/%.*s, add with initial state %.*s\n"
 +                                ,local_user->len, local_user->s
-+                                ,remote_user->len, remote_user->s);
++                                ,remote_user->len, remote_user->s
++                                ,state->len, state->s);
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
 +				LM_ERR("Failed to construct BLF XML doc\n");
@@ -705,10 +706,11 @@ index 0000000..fe2989c
 +		}
 +		lock_release(&dbk_phtable[hash_code].lock);
 +		if (!terminated) {
-+                        LM_INFO("Dialog %.*s not found for %.*s/%.*s, created a new one\n"
++                        LM_INFO("Dialog %.*s not found for %.*s/%.*s, add with initial state %.*s\n"
 +                                ,callid->len, callid->s
 +                                ,local_user->len, local_user->s
-+                                ,remote_user->len, remote_user->s);
++                                ,remote_user->len, remote_user->s
++                                ,state->len, state->s);
 +			LM_DBG("Dialog record not found, insert a new one\n");
 +			if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
 +				callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
@@ -736,6 +738,10 @@ index 0000000..fe2989c
 +			pu->pd = pd;
 +			lock_release(&dbk_phtable[hash_code].lock);
 +		} else { /* terminated */
++                        LM_INFO("Dialog %.*s not found for %.*s/%.*s, building terminated body\n"
++                                ,callid->len, callid->s
++                                ,local_user->len, local_user->s
++                                ,remote_user->len, remote_user->s);
 +			body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +		}
@@ -750,10 +756,11 @@ index 0000000..fe2989c
 +	}
 +
 +	if (!terminated) {
-+                LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, update the body\n"
++                LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, update the state %.*s\n"
 +                        ,local_user->len, local_user->s
 +                        ,remote_user->len, remote_user->s
-+                        ,callid->len, callid->s);
++                        ,callid->len, callid->s
++                        ,state->len, state->s);
 +		/* update only the body */
 +		lock_release(&dbk_phtable[hash_code].lock);
 +
@@ -804,7 +811,7 @@ index 0000000..fe2989c
 +		}
 +		lock_release(&dbk_phtable[hash_code].lock);
 +	} else {
-+		LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, state terminated, delete\n"
++		LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, cleanup state terminated\n"
 +                        ,local_user->len, local_user->s
 +                        ,remote_user->len, remote_user->s
 +                        ,callid->len, callid->s);
@@ -1168,7 +1175,7 @@ index 0000000..fe2989c
 +	pres_uri.s = pres_uri_buf;
 +	pres_uri.len = sprintf(pres_uri_buf, "sip:%.*s@%.*s", username.len, username.s, domain.len, domain.s);
 +
-+	LM_INFO("dbk presence query %s\n", pres_uri.s);
++	LM_DBG("dbk presence query %s\n", pres_uri.s);
 +	
 +	db_res = db_new_result();
 +	if ( db_res == NULL ) {
