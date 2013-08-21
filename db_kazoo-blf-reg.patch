@@ -1,4 +1,4 @@
-From cf3c23be62500be07193f62d2d9e4b22e430e5c9 Mon Sep 17 00:00:00 2001
+From c92bb8e826e6135d9ebeab9e980d638ac5e6c3d2 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Tue, 20 Aug 2013 22:50:46 -0400
 Subject: [PATCH] tweak
@@ -80,7 +80,7 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..f5e21eb
+index 0000000..b0d37f4
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
 @@ -0,0 +1,1557 @@
@@ -565,8 +565,6 @@ index 0000000..f5e21eb
 +		if (prev_pd_addr && pd != prev_pd_addr)
 +			continue;
 +
-+		pd_prev = pd;
-+
 +		if (pd->callid.len==callid->len && memcmp(pd->callid.s, callid->s, callid->len)==0 &&
 +			(!localtag->len || !pd->localtag.len || (localtag->len==pd->localtag.len &&
 +			memcmp(localtag->s, pd->localtag.s, localtag->len)==0)) && 
@@ -574,6 +572,8 @@ index 0000000..f5e21eb
 +			memcmp(remotetag->s, pd->remotetag.s, remotetag->len)==0)) ) {
 +			break;
 +		}
++
++		pd_prev = pd;
 +	}
 +
 +	if (*pd_prev_ret) *pd_prev_ret = pd_prev;
