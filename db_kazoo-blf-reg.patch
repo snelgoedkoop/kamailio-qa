@@ -1,11 +1,11 @@
-From 8f0e3d363682e6a3e223e45fc8d66dbd1c1b7a41 Mon Sep 17 00:00:00 2001
+From 029066d2f43a86da4b317f0c07183e15a8f4dcc4 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Tue, 20 Aug 2013 22:50:46 -0400
 Subject: [PATCH] tweak
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1560 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1562 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  945 ++++++++++++
@@ -30,7 +30,7 @@ Subject: [PATCH] tweak
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 26 files changed, 3265 insertions(+), 56 deletions(-)
+ 26 files changed, 3267 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -80,10 +80,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..26539a3
+index 0000000..e37fabd
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1560 @@
+@@ -0,0 +1,1562 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -813,12 +813,12 @@ index 0000000..26539a3
 +		}
 +		lock_release(&dbk_phtable[hash_code].lock);
 +	} else {
-+		LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, cleanup state terminated\n"
-+                        ,local_user->len, local_user->s
-+                        ,remote_user->len, remote_user->s
-+                        ,callid->len, callid->s);
++                LM_INFO("pd_prev: %p  pd->next: %p\n", pd_prev, pd->next);
 +		if (pd_prev == NULL && pd->next == NULL) { // there is no other dialog record
-+			LM_DBG("No other dialog - delete pu record\n");
++                        LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, no remaining dialogs removing pu record\n"
++                          ,local_user->len, local_user->s
++                          ,remote_user->len, remote_user->s
++                          ,callid->len, callid->s);
 +			/* delete pu */
 +			if (pu_prev) {
 +				pu_prev->next = pu->next;
@@ -832,8 +832,10 @@ index 0000000..26539a3
 +        		initiator, localtag, remotetag, 0 , 0, 0);
 +			goto ret_current_dialog;
 +		} else {
-+                        LM_DBG("Other dialog for %.*s - delete pd record\n"
-+                               ,callid->len, callid->s);
++                        LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, other dialogs remain\n"
++                          ,local_user->len, local_user->s
++                          ,remote_user->len, remote_user->s
++                          ,callid->len, callid->s);
 +			/* delete pd */
 +			if (pd_prev) {
 +				pd_prev->next = pd->next;
