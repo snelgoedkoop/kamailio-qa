@@ -1,11 +1,11 @@
-From 076adca47cd1d518655836b65166cb4c22f71ac8 Mon Sep 17 00:00:00 2001
+From f4683b3d57be7ffd801f92c5b7eff3f174d20e4e Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Tue, 20 Aug 2013 22:50:46 -0400
 Subject: [PATCH] tweak
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1569 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1565 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  945 ++++++++++++
@@ -30,7 +30,7 @@ Subject: [PATCH] tweak
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 26 files changed, 3274 insertions(+), 56 deletions(-)
+ 26 files changed, 3270 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -80,10 +80,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..b1fb1e3
+index 0000000..42141c3
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1569 @@
+@@ -0,0 +1,1565 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -565,13 +565,11 @@ index 0000000..b1fb1e3
 +	dbk_pres_dialog_t *pd, *pd_prev = NULL;
 +
 +	for (pd = pu->pd; pd; pd = pd->next) {
-+               LM_INFO("pd: %p  pd_prev: %p\n", pd, pd_prev);
-+          /*
 +               if (prev_pd_addr && pd != prev_pd_addr) {
 +                        pd_prev = pd;
 +			continue;
 +                }
-+          */
++
 +		if (pd->callid.len==callid->len && memcmp(pd->callid.s, callid->s, callid->len)==0 &&
 +			(!localtag->len || !pd->localtag.len || (localtag->len==pd->localtag.len &&
 +			memcmp(localtag->s, pd->localtag.s, localtag->len)==0)) && 
@@ -583,9 +581,7 @@ index 0000000..b1fb1e3
 +		pd_prev = pd;
 +	}
 +
-+        if (*pd_prev_ret) *pd_prev_ret = pd_prev;
-+
-+        LM_INFO("pd_prev: %p  pd_prev_ret: %p\n", pd_prev, *pd_prev_ret);
++        if (pd_prev_ret) *pd_prev_ret = pd_prev;
 +
 +	return pd;
 +}
