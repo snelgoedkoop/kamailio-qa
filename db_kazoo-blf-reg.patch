@@ -1,11 +1,11 @@
-From b3880cc60defc7c65110293151f12c9f5cff4091 Mon Sep 17 00:00:00 2001
+From 10b177529febbc8713bd666465cde80dbeb42229 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Tue, 20 Aug 2013 22:50:46 -0400
 Subject: [PATCH] tweak
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1563 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1573 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  945 ++++++++++++
@@ -30,7 +30,7 @@ Subject: [PATCH] tweak
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 26 files changed, 3268 insertions(+), 56 deletions(-)
+ 26 files changed, 3278 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -80,10 +80,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..99e9b77
+index 0000000..5996be7
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1563 @@
+@@ -0,0 +1,1573 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -460,10 +460,12 @@ index 0000000..99e9b77
 +	dbk_pres_user_t *pu, *pu_prev = NULL;
 +
 +	for (pu = dbk_phtable[hash_code].pu; pu; pu = pu->next) {
++          /*
 +		if (prev_pu_addr && prev_pu_addr != pu) {
 +                        pu_prev = pu;
 +			continue;
 +		}
++          */
 +		if (pu->user.len == user->len &&
 +			 memcmp(pu->user.s, user->s, user->len)==0) {
 +			break;
@@ -562,7 +564,12 @@ index 0000000..99e9b77
 +{
 +	dbk_pres_dialog_t *pd, *pd_prev = NULL;
 +
++        if (*pd_prev_ret) {
++               pd_prev = *pd_prev_ret;
++        }
++
 +	for (pd = pu->pd; pd; pd = pd->next) {
++               LM_INFO("pd: %p  pd_prev: %p\n", pd, pd_prev);
 +          /*
 +               if (prev_pd_addr && pd != prev_pd_addr) {
 +                        pd_prev = pd;
@@ -580,7 +587,10 @@ index 0000000..99e9b77
 +		pd_prev = pd;
 +	}
 +
-+	if (*pd_prev_ret) *pd_prev_ret = pd_prev;
++        if (*pd_prev_ret) *pd_prev_ret = pd_prev;
++
++        LM_INFO("pd_prev: %p  pd_prev_ret: %p\n", pd_prev, *pd_prev_ret);
++
 +	return pd;
 +}
 +
