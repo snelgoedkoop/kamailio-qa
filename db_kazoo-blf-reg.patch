@@ -1,11 +1,11 @@
-From 10b177529febbc8713bd666465cde80dbeb42229 Mon Sep 17 00:00:00 2001
+From 076adca47cd1d518655836b65166cb4c22f71ac8 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Tue, 20 Aug 2013 22:50:46 -0400
 Subject: [PATCH] tweak
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1573 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1569 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  187 +++
  modules/db_kazoo/dbase.c                           |  945 ++++++++++++
@@ -30,7 +30,7 @@ Subject: [PATCH] tweak
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 26 files changed, 3278 insertions(+), 56 deletions(-)
+ 26 files changed, 3274 insertions(+), 56 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -80,10 +80,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..5996be7
+index 0000000..b1fb1e3
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1573 @@
+@@ -0,0 +1,1569 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -563,10 +563,6 @@ index 0000000..5996be7
 +		str* remotetag, dbk_pres_dialog_t** pd_prev_ret, dbk_pres_dialog_t* prev_pd_addr) 
 +{
 +	dbk_pres_dialog_t *pd, *pd_prev = NULL;
-+
-+        if (*pd_prev_ret) {
-+               pd_prev = *pd_prev_ret;
-+        }
 +
 +	for (pd = pu->pd; pd; pd = pd->next) {
 +               LM_INFO("pd: %p  pd_prev: %p\n", pd, pd_prev);
