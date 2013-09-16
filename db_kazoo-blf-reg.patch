@@ -1,7 +1,7 @@
-From f4683b3d57be7ffd801f92c5b7eff3f174d20e4e Mon Sep 17 00:00:00 2001
+From 946eb1fc40324c1362e2c6131ccfb56d5ec8491e Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
-Date: Tue, 20 Aug 2013 22:50:46 -0400
-Subject: [PATCH] tweak
+Date: Mon, 16 Sep 2013 11:21:59 -0700
+Subject: [PATCH] correct length
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
@@ -25,7 +25,7 @@ Subject: [PATCH] tweak
  modules/pua/pua.c                                  |    4 +-
  modules/pua_dialoginfo/Makefile                    |    2 +
  modules/pua_dialoginfo/bind_dialoginfo.h           |   29 +
- modules/pua_dialoginfo/dialog_publish.c            |  104 ++-
+ modules/pua_dialoginfo/dialog_publish.c            |  104 +-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/usrloc/dlist.c                             |    3 +-
@@ -1875,7 +1875,7 @@ index 0000000..627ae7e
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..661e8f5
+index 0000000..9e9e577
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
 @@ -0,0 +1,945 @@
@@ -2606,7 +2606,7 @@ index 0000000..661e8f5
 +			str port = uri.port;
 +			if (port.len == 0) {
 +				port.s = "5060";
-+				port.len = 3;
++				port.len = 4;
 +			}
 +			received.s = recv_buf;
 +			received.len = sprintf(received.s, "sip:%.*s:%.*s",
@@ -3950,5 +3950,5 @@ index 77a2a40..af1ecd1 100644
  	return 0;
  }
 -- 
-1.7.1
+1.8.4
 
