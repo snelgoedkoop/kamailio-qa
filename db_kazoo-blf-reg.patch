@@ -1,7 +1,8 @@
-From 07f8454a58fc53a8993bfe087c0623c4a95077a2 Mon Sep 17 00:00:00 2001
+From 8b6454912ea46f633468ab54a70d7d6ab3bec124 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Wed, 25 Sep 2013 15:22:17 -0400
 Subject: [PATCH] updates to fix Polycom BLF
+ support min_expires
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
@@ -18,8 +19,10 @@ Subject: [PATCH] updates to fix Polycom BLF
  modules/presence/hash.c                            |    4 +-
  modules/presence/notify.c                          |   94 ++
  modules/presence/notify.h                          |    3 +
- modules/presence/presence.c                        |   12 +-
- modules/presence/subscribe.c                       |    7 +-
+ modules/presence/presence.c                        |   20 +-
+ modules/presence/presence.h                        |    1 +
+ modules/presence/subscribe.c                       |   17 +-
+ modules/presence/subscribe.h                       |    4 +-
  modules/presence_dialoginfo/bind_pres_dialoginfo.h |   28 +
  modules/presence_dialoginfo/notify_body.c          |   63 +-
  modules/presence_dialoginfo/notify_body.h          |    7 +
@@ -30,9 +33,12 @@ Subject: [PATCH] updates to fix Polycom BLF
  modules/pua_dialoginfo/dialog_publish.c            |  104 ++-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
+ modules/rls/rls.c                                  |    2 +
+ modules/rls/rls.h                                  |    1 +
+ modules/rls/subscribe.c                            |    7 +-
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 28 files changed, 3276 insertions(+), 61 deletions(-)
+ 33 files changed, 3300 insertions(+), 70 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -3177,10 +3183,39 @@ index 2eb91e4..ed5425d 100644
 +
  #endif
 diff --git a/modules/presence/presence.c b/modules/presence/presence.c
-index ed7f4d1..ebefb4e 100644
+index ed7f4d1..80f86f7 100644
 --- a/modules/presence/presence.c
 +++ b/modules/presence/presence.c
-@@ -311,6 +311,8 @@ static int mod_init(void)
+@@ -134,6 +134,7 @@ char prefix='a';
+ int startup_time=0;
+ str db_url = {0, 0};
+ int expires_offset = 0;
++int min_expires= 0;
+ int max_expires= 3600;
+ int shtable_size= 9;
+ shtable_t subs_htable= NULL;
+@@ -186,6 +187,7 @@ static param_export_t params[]={
+ 	{ "notifier_processes",     INT_PARAM, &pres_notifier_processes },
+ 	{ "to_tag_pref",            STR_PARAM, &to_tag_pref },
+ 	{ "expires_offset",         INT_PARAM, &expires_offset },
++	{ "min_expires",            INT_PARAM, &min_expires },
+ 	{ "max_expires",            INT_PARAM, &max_expires },
+ 	{ "server_address",         STR_PARAM, &server_address.s},
+ 	{ "subs_htable_size",       INT_PARAM, &shtable_size},
+@@ -262,6 +264,12 @@ static int mod_init(void)
+ 	if(max_expires<= 0)
+ 		max_expires = 3600;
+ 
++	if(min_expires < 0)
++		min_expires = 0;
++
++	if(min_expires > max_expires)
++		min_expires = max_expires;
++
+ 	if(server_address.s== NULL)
+ 		LM_DBG("server_address parameter not set in configuration file\n");
+ 	
+@@ -311,6 +319,8 @@ static int mod_init(void)
  		return -1;
  	}
  
@@ -3189,7 +3224,7 @@ index ed7f4d1..ebefb4e 100644
  	/*verify table versions */
  	if((db_check_table_version(&pa_dbf, pa_db, &presentity_table, P_TABLE_VERSION) < 0) ||
  		(db_check_table_version(&pa_dbf, pa_db, &watchers_table, S_TABLE_VERSION) < 0)) {
-@@ -323,6 +325,7 @@ static int mod_init(void)
+@@ -323,6 +333,7 @@ static int mod_init(void)
  		LM_ERR("wrong table version for %s\n", active_watchers_table.s);
  		return -1;
  	}
@@ -3197,7 +3232,7 @@ index ed7f4d1..ebefb4e 100644
  
  	if(subs_dbmode != DB_ONLY) {
  		if(shtable_size< 1)
-@@ -336,7 +339,7 @@ static int mod_init(void)
+@@ -336,7 +347,7 @@ static int mod_init(void)
  			LM_ERR(" initializing subscribe hash table\n");
  			return -1;
  		}
@@ -3206,7 +3241,7 @@ index ed7f4d1..ebefb4e 100644
  		{
  			LM_ERR("restoring subscribe info from database\n");
  			return -1;
-@@ -356,11 +359,13 @@ static int mod_init(void)
+@@ -356,11 +367,13 @@ static int mod_init(void)
  			return -1;
  		}
  
@@ -3220,7 +3255,7 @@ index ed7f4d1..ebefb4e 100644
  	}
  
  	startup_time = (int) time(NULL);
-@@ -392,10 +397,10 @@ static int mod_init(void)
+@@ -392,10 +405,10 @@ static int mod_init(void)
  
  		register_basic_timers(pres_notifier_processes);
  	}
@@ -3233,7 +3268,7 @@ index ed7f4d1..ebefb4e 100644
  	return 0;
  }
  
-@@ -671,6 +676,7 @@ error:
+@@ -671,6 +684,7 @@ error:
  	return -1;
  }
  
@@ -3241,8 +3276,20 @@ index ed7f4d1..ebefb4e 100644
  /*! \brief
   *  mi cmd: refreshWatchers
   *			\<presentity_uri> 
+diff --git a/modules/presence/presence.h b/modules/presence/presence.h
+index e064bb2..67306ec 100644
+--- a/modules/presence/presence.h
++++ b/modules/presence/presence.h
+@@ -76,6 +76,7 @@ extern int startup_time;
+ extern char *to_tag_pref;
+ extern int expires_offset;
+ extern str server_address;
++extern int min_expires;
+ extern int max_expires;
+ extern int subs_dbmode;
+ extern int publ_cache_enabled;
 diff --git a/modules/presence/subscribe.c b/modules/presence/subscribe.c
-index aff55f3..534d345 100644
+index aff55f3..ab289c5 100644
 --- a/modules/presence/subscribe.c
 +++ b/modules/presence/subscribe.c
 @@ -619,12 +619,12 @@ int update_subscription(struct sip_msg* msg, subs_t* subs, int to_tag_gen,
@@ -3267,7 +3314,38 @@ index aff55f3..534d345 100644
  				if(insert_subs_db(subs, REMOTE_TYPE) < 0)
  				{
  					LM_ERR("failed to insert new record in database\n");
-@@ -1384,7 +1383,7 @@ found_rec:
+@@ -849,7 +848,7 @@ int handle_subscribe(struct sip_msg* msg, str watcher_user, str watcher_domain)
+ 		ev_param= ev_param->next;
+ 	}
+ 	
+-	if(extract_sdialog_info(&subs, msg, max_expires, &to_tag_gen,
++	if(extract_sdialog_info(&subs, msg, min_expires, max_expires, &to_tag_gen,
+ 				server_address, watcher_user, watcher_domain)< 0)
+ 	{
+ 		LM_ERR("failed to extract dialog information\n");
+@@ -1074,9 +1073,9 @@ error:
+ }
+ 
+ 
+-int extract_sdialog_info(subs_t* subs,struct sip_msg* msg, int mexp,
+-		int* to_tag_gen, str scontact, str watcher_user,
+-		str watcher_domain)
++int extract_sdialog_info(subs_t* subs,struct sip_msg* msg, int miexp,
++                int mexp, int* to_tag_gen, str scontact,
++                str watcher_user, str watcher_domain)
+ {
+ 	str rec_route= {0, 0};
+ 	int rt  = 0;
+@@ -1105,6 +1104,8 @@ int extract_sdialog_info(subs_t* subs,struct sip_msg* msg, int mexp,
+ 	}
+ 	if(lexpire > mexp)
+ 		lexpire = mexp;
++	if (lexpire && miexp && lexpire < miexp)
++                lexpire = miexp;
+ 
+ 	subs->expires = lexpire;
+ 
+@@ -1384,7 +1385,7 @@ found_rec:
  	if(subs->pres_uri.s == NULL)
  		subs->pres_uri= pres_uri;
  
@@ -3276,7 +3354,7 @@ index aff55f3..534d345 100644
  	subs->status= s->status;
  	if(s->reason.s && s->reason.len)
  	{
-@@ -1552,7 +1551,7 @@ int get_database_info(struct sip_msg* msg, subs_t* subs, int* reply_code, str* r
+@@ -1552,7 +1553,7 @@ int get_database_info(struct sip_msg* msg, subs_t* subs, int* reply_code, str* r
  	}
  
  	subs->local_cseq= row_vals[local_cseq_col].val.int_val + 1;
@@ -3285,6 +3363,23 @@ index aff55f3..534d345 100644
  
  	if(!EVENT_DIALOG_SLA(subs->event->evp))
  	{
+diff --git a/modules/presence/subscribe.h b/modules/presence/subscribe.h
+index 64938ca..5c37f84 100644
+--- a/modules/presence/subscribe.h
++++ b/modules/presence/subscribe.h
+@@ -113,10 +113,10 @@ void update_db_subs_timer(db1_con_t *db,db_func_t dbf, shtable_t hash_table,
+ typedef void (*update_db_subs_t)(db1_con_t * ,db_func_t ,shtable_t ,int ,int ,
+ 		handle_expired_func_t);
+ 
+-int extract_sdialog_info(subs_t* subs,struct sip_msg* msg, int max_expire,
++int extract_sdialog_info(subs_t* subs,struct sip_msg* msg, int min_expire, int max_expire,
+ 		int* to_tag_gen, str scontact, str watcher_user, str watcher_domain);
+ typedef int (*extract_sdialog_info_t)(subs_t* subs, struct sip_msg* msg,
+-		int max_expire, int* to_tag_gen, str scontact, str watcher_user,
++		int min_expire, int max_expire, int* to_tag_gen, str scontact, str watcher_user,
+ 		str watcher_domain);
+ void delete_subs(str* pres_uri, str* ev_name, str* to_tag, str* from_tag, str* callid);
+ 
 diff --git a/modules/presence_dialoginfo/bind_pres_dialoginfo.h b/modules/presence_dialoginfo/bind_pres_dialoginfo.h
 new file mode 100644
 index 0000000..c9174fa
@@ -3959,6 +4054,56 @@ index f6e43b6..c2d002a 100644
 +	unsigned int initiator, str *localtag, str *remotetag,
 +	str *localtarget, str *remotetarget, int version);
  #endif
+diff --git a/modules/rls/rls.c b/modules/rls/rls.c
+index 08dedcf..a5263d5 100644
+--- a/modules/rls/rls.c
++++ b/modules/rls/rls.c
+@@ -136,6 +136,7 @@ update_db_subs_t pres_update_db_subs_timer;
+ extract_sdialog_info_t pres_extract_sdialog_info;
+ int rls_events= EVENT_PRESENCE;
+ int to_presence_code = 1;
++int rls_min_expires = 0;
+ int rls_max_expires = 7200;
+ int rls_reload_db_subs = 0;
+ int rls_max_notify_body_len = 0;
+@@ -238,6 +239,7 @@ static param_export_t params[]={
+ 	{ "notifier_processes",     INT_PARAM,   &rls_notifier_processes         },
+ 	{ "clean_period",           INT_PARAM,   &clean_period                   },
+ 	{ "rlpres_clean_period",    INT_PARAM,   &rlpres_clean_period            },
++	{ "min_expires",            INT_PARAM,   &rls_min_expires                },
+ 	{ "max_expires",            INT_PARAM,   &rls_max_expires                },
+ 	{ "hash_size",              INT_PARAM,   &hash_size                      },
+ 	{ "integrated_xcap_server", INT_PARAM,   &rls_integrated_xcap_server     },
+diff --git a/modules/rls/rls.h b/modules/rls/rls.h
+index a3b3c39..2557ab0 100644
+--- a/modules/rls/rls.h
++++ b/modules/rls/rls.h
+@@ -96,6 +96,7 @@ extern str rls_xcap_table;
+ extern str db_url;
+ extern int hash_size;
+ extern shtable_t rls_table;
++extern int rls_min_expires;
+ extern int rls_max_expires;
+ extern int rls_integrated_xcap_server;
+ extern int rls_events;
+diff --git a/modules/rls/subscribe.c b/modules/rls/subscribe.c
+index 5ebd739..89cdf6c 100644
+--- a/modules/rls/subscribe.c
++++ b/modules/rls/subscribe.c
+@@ -595,9 +595,10 @@ int rls_handle_subscribe(struct sip_msg* msg, str watcher_user, str watcher_doma
+ 	}
+ 
+ 	/* extract dialog information from message headers */
+-	if(pres_extract_sdialog_info(&subs, msg, rls_max_expires,
+-				&to_tag_gen, rls_server_address,
+-				watcher_user, watcher_domain)<0)
++	if(pres_extract_sdialog_info(&subs, msg, rls_min_expires,
++                                rls_max_expires, &to_tag_gen,
++                                rls_server_address, watcher_user,
++                                watcher_domain)<0)
+ 	{
+ 		LM_ERR("bad subscribe request\n");
+ 		goto error;
 diff --git a/modules/usrloc/dlist.c b/modules/usrloc/dlist.c
 index 2f14f16..e4cc08e 100644
 --- a/modules/usrloc/dlist.c
