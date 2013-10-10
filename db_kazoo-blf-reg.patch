@@ -1,14 +1,13 @@
-From e1e3f0cc1304968fe96ee0a9ef313ce38b51f6f1 Mon Sep 17 00:00:00 2001
-From: karl anderson <karl@2600hz.com>
-Date: Fri, 4 Oct 2013 15:03:40 -0400
-Subject: [PATCH] current patch
+From 88610c1e922639e61c2fdf0fd3fe4e23b383a342 Mon Sep 17 00:00:00 2001
+From: James Aimonetti <james@2600hz.org>
+Date: Wed, 9 Oct 2013 17:19:19 -0700
+Subject: [PATCH] KAZOO-1467: ensure all tm bindings are present on init
 
-tweak reconnect
 ---
  modules/db_kazoo/Makefile                          |   32 +
  modules/db_kazoo/blf.c                             | 1574 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
- modules/db_kazoo/db_kazoo.c                        |  192 +++
+ modules/db_kazoo/db_kazoo.c                        |  206 +++
  modules/db_kazoo/dbase.c                           |  941 ++++++++++++
  modules/db_kazoo/dbase.h                           |  100 ++
  modules/dispatcher/dispatch.c                      |    8 +-
@@ -30,7 +29,7 @@ tweak reconnect
  modules/pua/pua.c                                  |    4 +-
  modules/pua_dialoginfo/Makefile                    |    2 +
  modules/pua_dialoginfo/bind_dialoginfo.h           |   29 +
- modules/pua_dialoginfo/dialog_publish.c            |  104 ++-
+ modules/pua_dialoginfo/dialog_publish.c            |  104 +-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/rls/rls.c                                  |    2 +
@@ -38,7 +37,7 @@ tweak reconnect
  modules/rls/subscribe.c                            |    7 +-
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 33 files changed, 3317 insertions(+), 70 deletions(-)
+ 33 files changed, 3331 insertions(+), 70 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -50,7 +49,7 @@ tweak reconnect
 
 diff --git a/modules/db_kazoo/Makefile b/modules/db_kazoo/Makefile
 new file mode 100644
-index 0000000..668d68c
+index 0000000..90671a4
 --- /dev/null
 +++ b/modules/db_kazoo/Makefile
 @@ -0,0 +1,32 @@
@@ -88,7 +87,7 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..8eba2f9
+index 0000000..56f242f
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
 @@ -0,0 +1,1574 @@
@@ -155,7 +154,7 @@ index 0000000..8eba2f9
 +
 +int dbk_initialize_presence()
 +{
-+  str unique_string;
++  str unique_string = {0, 0};
 +  
 +  LM_DBG("dbk_initialize_presence\n");
 +  /* bind to presence module */
@@ -1699,10 +1698,10 @@ index 0000000..3df3113
 +#endif
 diff --git a/modules/db_kazoo/db_kazoo.c b/modules/db_kazoo/db_kazoo.c
 new file mode 100644
-index 0000000..03286e8
+index 0000000..b33b0cd
 --- /dev/null
 +++ b/modules/db_kazoo/db_kazoo.c
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,206 @@
 +/*
 + * $Id$
 + *
@@ -1751,7 +1750,7 @@ index 0000000..03286e8
 +str dbk_reg_fs_path={0, 0};
 +int dbk_auth_wait_timeout = 3;
 +int dbk_reconn_retries = 8;
-+
++int tm_bound = 0;
 +struct tm_binds tmb;
 +
 +MODULE_VERSION
@@ -1812,11 +1811,15 @@ index 0000000..03286e8
 +	if (dbk_reg_fs_path.s) dbk_reg_fs_path.len = strlen(dbk_reg_fs_path.s);
 +
 +	/* load all TM stuff */
-+	if(load_tm_api(&tmb)==-1)
-+	{
++	if(!tm_bound) 
++        {
++            if(load_tm_api(&tmb)==-1)
++	    {
 +		LM_ERR("Can't load tm functions. Module TM not loaded?\n");
 +		return -1;
-+	}
++	    }
++            tm_bound = 1;
++        }
 +
 +	return 0;
 +}
@@ -1872,6 +1875,16 @@ index 0000000..03286e8
 +	if(dbb==NULL)
 +		return -1;
 +
++	/* load all TM stuff */
++	if(!tm_bound) 
++        {
++            if(load_tm_api(&tmb)==-1)
++	    {
++		LM_ERR("Can't load tm functions. Module TM not loaded?\n");
++		return -1;
++	    }
++            tm_bound = 1;
++        }
 +	memset(dbb, 0, sizeof(db_func_t));
 +
 +	dbb->init             = db_kazoo_init;
@@ -4173,5 +4186,5 @@ index 77a2a40..af1ecd1 100644
  	return 0;
  }
 -- 
-1.7.1
+1.8.4
 
