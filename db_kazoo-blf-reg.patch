@@ -1,15 +1,15 @@
-From 88610c1e922639e61c2fdf0fd3fe4e23b383a342 Mon Sep 17 00:00:00 2001
-From: James Aimonetti <james@2600hz.org>
-Date: Wed, 9 Oct 2013 17:19:19 -0700
-Subject: [PATCH] KAZOO-1467: ensure all tm bindings are present on init
+From d44544a0a5d4004a6e1f415a1cadf75f52cbec62 Mon Sep 17 00:00:00 2001
+From: karl anderson <karl@2600hz.com>
+Date: Thu, 24 Oct 2013 18:50:24 -0400
+Subject: [PATCH] add support to handle tls
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
  modules/db_kazoo/blf.c                             | 1574 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
- modules/db_kazoo/db_kazoo.c                        |  206 +++
- modules/db_kazoo/dbase.c                           |  941 ++++++++++++
- modules/db_kazoo/dbase.h                           |  100 ++
+ modules/db_kazoo/db_kazoo.c                        |  208 +++
+ modules/db_kazoo/dbase.c                           |  943 ++++++++++++
+ modules/db_kazoo/dbase.h                           |  101 ++
  modules/dispatcher/dispatch.c                      |    8 +-
  modules/dispatcher/dispatch.h                      |    1 +
  modules/dispatcher/dispatcher.c                    |   10 +
@@ -29,7 +29,7 @@ Subject: [PATCH] KAZOO-1467: ensure all tm bindings are present on init
  modules/pua/pua.c                                  |    4 +-
  modules/pua_dialoginfo/Makefile                    |    2 +
  modules/pua_dialoginfo/bind_dialoginfo.h           |   29 +
- modules/pua_dialoginfo/dialog_publish.c            |  104 +-
+ modules/pua_dialoginfo/dialog_publish.c            |  104 ++-
  modules/pua_dialoginfo/pua_dialoginfo.c            |   78 +-
  modules/pua_dialoginfo/pua_dialoginfo.h            |    7 +
  modules/rls/rls.c                                  |    2 +
@@ -37,7 +37,7 @@ Subject: [PATCH] KAZOO-1467: ensure all tm bindings are present on init
  modules/rls/subscribe.c                            |    7 +-
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 33 files changed, 3331 insertions(+), 70 deletions(-)
+ 33 files changed, 3336 insertions(+), 70 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -49,7 +49,7 @@ Subject: [PATCH] KAZOO-1467: ensure all tm bindings are present on init
 
 diff --git a/modules/db_kazoo/Makefile b/modules/db_kazoo/Makefile
 new file mode 100644
-index 0000000..90671a4
+index 0000000..668d68c
 --- /dev/null
 +++ b/modules/db_kazoo/Makefile
 @@ -0,0 +1,32 @@
@@ -1698,10 +1698,10 @@ index 0000000..3df3113
 +#endif
 diff --git a/modules/db_kazoo/db_kazoo.c b/modules/db_kazoo/db_kazoo.c
 new file mode 100644
-index 0000000..b33b0cd
+index 0000000..8b2d3a5
 --- /dev/null
 +++ b/modules/db_kazoo/db_kazoo.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,208 @@
 +/*
 + * $Id$
 + *
@@ -1750,6 +1750,7 @@ index 0000000..b33b0cd
 +str dbk_reg_fs_path={0, 0};
 +int dbk_auth_wait_timeout = 3;
 +int dbk_reconn_retries = 8;
++int use_contact_for_reg_notice = 0;
 +int tm_bound = 0;
 +struct tm_binds tmb;
 +
@@ -1769,6 +1770,7 @@ index 0000000..b33b0cd
 +	{"register_fs_path",  STR_PARAM, &dbk_reg_fs_path.s  },
 +	{"auth_wait_timeout", INT_PARAM, &dbk_auth_wait_timeout},
 +	{"reconn_retries",    INT_PARAM, &dbk_reconn_retries},
++        {"use_contact_for_reg_notice", INT_PARAM, &use_contact_for_reg_notice},
 +	{0, 0, 0}
 +};
 +static mi_export_t mi_cmds[] = {
@@ -1910,10 +1912,10 @@ index 0000000..b33b0cd
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..6cbb9aa
+index 0000000..e2bd247
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
-@@ -0,0 +1,941 @@
+@@ -0,0 +1,943 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -2630,11 +2632,13 @@ index 0000000..6cbb9aa
 +        LM_DBG("Null socket -> can not get the network IP and port\n");
 +      }
 +    } else if (!received.len && strncmp(_k[col]->s, "received", 8) == 0) {
-+      if (!_v[col].nul) {
-+        received = _v[col].val.str_val;
-+      } else {
-+        LM_DBG("NULL received - construct from contact\n");
-+      }
++        if (use_contact_for_reg_notice == 0) {
++          LM_DBG("use_contact_for_reg_notice - construct from contact\n");
++        } else if (!_v[col].nul) {
++          received = _v[col].val.str_val;
++        } else {
++          LM_DBG("NULL received - construct from contact\n");
++        }
 +    }
 +  }
 +  
@@ -2857,10 +2861,10 @@ index 0000000..6cbb9aa
 +}
 diff --git a/modules/db_kazoo/dbase.h b/modules/db_kazoo/dbase.h
 new file mode 100644
-index 0000000..678ec63
+index 0000000..64faded
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.h
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,101 @@
 +#ifndef _DB_KAZOO_DBASE_
 +#define _DB_KAZOO_DBASE_
 +
@@ -2874,6 +2878,7 @@ index 0000000..678ec63
 +extern str dbk_reg_fs_path;
 +extern int dbk_auth_wait_timeout;
 +extern int dbk_reconn_retries;
++extern int use_contact_for_reg_notice;
 +extern struct tm_binds tmb;
 +
 +typedef struct rmq_conn {
@@ -4186,5 +4191,5 @@ index 77a2a40..af1ecd1 100644
  	return 0;
  }
 -- 
-1.8.4
+1.7.1
 
