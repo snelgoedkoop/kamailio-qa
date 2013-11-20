@@ -1,11 +1,11 @@
-From d44544a0a5d4004a6e1f415a1cadf75f52cbec62 Mon Sep 17 00:00:00 2001
+From fa06ca34f9bda6e355411586c92ad857329b0404 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Thu, 24 Oct 2013 18:50:24 -0400
-Subject: [PATCH] add support to handle tls
+Subject: [PATCH] do not use contact by default, and fix race-condition resulting in duplicate hash entries
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
- modules/db_kazoo/blf.c                             | 1574 ++++++++++++++++++++
+ modules/db_kazoo/blf.c                             | 1532 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  208 +++
  modules/db_kazoo/dbase.c                           |  943 ++++++++++++
@@ -37,7 +37,7 @@ Subject: [PATCH] add support to handle tls
  modules/rls/subscribe.c                            |    7 +-
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 33 files changed, 3336 insertions(+), 70 deletions(-)
+ 33 files changed, 3294 insertions(+), 70 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -87,10 +87,10 @@ index 0000000..668d68c
 +include ../../Makefile.modules
 diff --git a/modules/db_kazoo/blf.c b/modules/db_kazoo/blf.c
 new file mode 100644
-index 0000000..56f242f
+index 0000000..9067ed7
 --- /dev/null
 +++ b/modules/db_kazoo/blf.c
-@@ -0,0 +1,1574 @@
+@@ -0,0 +1,1532 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -555,20 +555,18 @@ index 0000000..56f242f
 +  return pu;
 +}
 +
-+int dbk_pres_insert_pu(str* user, str* callid, str* localtag, str* remotetag, str* body,
++int dbk_pres_insert_pu(str* local_user, str* callid, str* localtag, str* remotetag, str* body,
 +                       unsigned int hash_code) 
 +{
-+  dbk_pres_user_t* pu = dbk_new_pres_user(user, callid, localtag, remotetag, body);
-+  
++  dbk_pres_user_t* pu = dbk_new_pres_user(local_user, callid, localtag, remotetag, body);
++
 +  if (pu == NULL) {
 +    LM_ERR("Failed to create new pres user\n");
 +    return -1;
 +  }
-+  
-+  lock_get(&dbk_phtable[hash_code].lock);
++
 +  pu->next = dbk_phtable[hash_code].pu;
 +  dbk_phtable[hash_code].pu = pu;
-+  lock_release(&dbk_phtable[hash_code].lock);
 +  return 0;
 +}
 +
@@ -687,42 +685,41 @@ index 0000000..56f242f
 +  pu = dbk_pres_search_pu(hash_code, local_user, &pu_prev, 0);
 +  
 +  /**  1. No record for user */
-+  if (pu == NULL) {	
-+    lock_release(&dbk_phtable[hash_code].lock);
++  if (pu == NULL) {
 +    if (!terminated) {		
 +      LM_INFO("No record found for %.*s/%.*s, add with initial state %.*s\n"
 +              ,local_user->len, local_user->s
 +              ,remote_user->len, remote_user->s
 +              ,state->len, state->s);
-+      if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
-+                                                       callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++      if ((body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++                                                      callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++        lock_release(&dbk_phtable[hash_code].lock);
 +        LM_ERR("Failed to construct BLF XML doc\n");
 +        return NULL;
 +      }
 +      LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
-+      
-+      if ( dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code) < 0) {
++      if (dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code) < 0) {
 +        LM_ERR("Failed to insert new pres_user in htable\n");
 +      }
++      lock_release(&dbk_phtable[hash_code].lock);
 +      return body;
 +    }
++    lock_release(&dbk_phtable[hash_code].lock);
 +    LM_INFO("No record found for %.*s/%.*s and state terminated, do nothing\n"
 +            ,local_user->len, local_user->s
 +            ,remote_user->len, remote_user->s);
 +    return pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +                                               initiator, localtag, remotetag, 0 , 0, 0);
 +  }
-+  
++
 +  pd = dbk_pres_pu_search_pd(pu, callid, localtag, remotetag, &pd_prev, 0);
 +  
 +  /**  2. Existing record for user, no record for dialog */
-+  if (pd == NULL) {
-+    
++  if (pd == NULL) {    
 +    /* copy the other bodies to create the aggregated body */
 +    if (pu->pd != NULL) {
 +      dbk_blf_copy_bodies(pu, NULL, dlg_bodies, &dlg_no);
 +    }
-+    lock_release(&dbk_phtable[hash_code].lock);
 +    if (!terminated) {
 +      LM_INFO("Dialog %.*s not found for %.*s/%.*s, add with initial state %.*s\n"
 +              ,callid->len, callid->s
@@ -730,31 +727,21 @@ index 0000000..56f242f
 +              ,remote_user->len, remote_user->s
 +              ,state->len, state->s);
 +      LM_DBG("Dialog record not found, insert a new one\n");
-+      if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
-+                                                       callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++      if ((body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++                                                      callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++        lock_release(&dbk_phtable[hash_code].lock);
 +        LM_ERR("Failed to construct BLF XML doc\n");
 +        goto ret_current_dialog;
 +      }
-+      LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
-+      
++      LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);      
 +      pd = dbk_new_pres_dialog(callid, localtag, remotetag, body);
 +      if (pd == NULL) {
++        lock_release(&dbk_phtable[hash_code].lock);
 +        LM_ERR("Failed to create new pres dialog\n");
 +        goto ret_agg_dialogs;
 +      }
-+      lock_get(&dbk_phtable[hash_code].lock);
-+      /* search again the corresponding pu
-+       * give it the prev addr to speed up the search */
-+      pu = dbk_pres_search_pu(hash_code, local_user, 0, pu); 
-+      if (pu == NULL) { /* pu deleted in the meantime (another dialog ended) */
-+        lock_release(&dbk_phtable[hash_code].lock);
-+        shm_free(pd);
-+        dbk_pres_insert_pu(local_user, callid, localtag, remotetag, body, hash_code); 
-+        goto ret_current_dialog;
-+      }		
 +      pd->next = pu->pd;
 +      pu->pd = pd;
-+      lock_release(&dbk_phtable[hash_code].lock);
 +    } else { /* terminated */
 +      LM_INFO("Dialog %.*s not found for %.*s/%.*s, building terminated body\n"
 +              ,callid->len, callid->s
@@ -763,73 +750,45 @@ index 0000000..56f242f
 +      body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +                                                 initiator, localtag, remotetag, 0 , 0, 0);
 +    }
++    lock_release(&dbk_phtable[hash_code].lock);
 +    goto ret_agg_dialogs;
 +  }
 +  
-+  /**  3. Existing record for user and existing record for dialog */
-+  
++  /**  3. Existing record for user and existing record for dialog */  
 +  /* If there are other dialogs, make a copy of the bodies */
 +  if (pu->pd != pd || pd->next != NULL) {
 +    dbk_blf_copy_bodies(pu, pd, dlg_bodies, &dlg_no);
 +  }
-+  
 +  if (!terminated) {
 +    LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, update the state %.*s\n"
 +            ,local_user->len, local_user->s
 +            ,remote_user->len, remote_user->s
 +            ,callid->len, callid->s
 +            ,state->len, state->s);
-+    /* update only the body */
-+    lock_release(&dbk_phtable[hash_code].lock);
-+    
-+    if ( (body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
-+                                                     callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++    /* update only the body */ 
++    if ((body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user,
++                                                    callid, initiator, localtag, remotetag, 0 , 0, 0))== NULL) {
++      lock_release(&dbk_phtable[hash_code].lock);
 +      LM_ERR("Failed to construct BLF XML doc\n");
 +      goto ret_current_dialog;
 +    }
-+    LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);
-+    
-+    lock_get(&dbk_phtable[hash_code].lock);
-+    /* search again the corresponding pu;
-+     * give it the prev addr to speed up the search */
-+    pu = dbk_pres_search_pu(hash_code, local_user, 0, pu); 
-+    if (pu == NULL) { /* pres user deleted in the meantime (my dialog ended) */
-+      lock_release(&dbk_phtable[hash_code].lock);
-+      LM_INFO("Dialog %.*s deleted in the meantime (my dialog must have ended)\n"
-+              ,callid->len, callid->s);
-+      dbk_free_xml(body);
-+      body = NULL;
-+      goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
-+    }		
-+    
-+    pd = dbk_pres_pu_search_pd(pu, callid, localtag, remotetag, &pd_prev, pd);
-+    if (pd == NULL) {
-+      lock_release(&dbk_phtable[hash_code].lock);
-+      LM_INFO("Dialog %.*s deleted in the meantime (my dialog must have ended)\n"
-+              ,callid->len, callid->s);
-+      dbk_free_xml(body);
-+      body = NULL;
-+      goto ret_current_dialog; /* to free the dlg_bodies array if there is anything there */
-+    }
-+    
++    LM_DBG("dialoginfo body [%.*s]\n", body->len, body->s);    
 +    if (pd->body_size_alloc < body->len) {
 +      pd->body_size_alloc = body->len * 2;
 +      pd->body.s = (char*) shm_realloc(pd->body.s, pd->body_size_alloc);
 +      if (pd->body.s == NULL) {
-+        LM_ERR("No more shared memory\n");
 +        lock_release(&dbk_phtable[hash_code].lock);
++        LM_ERR("No more shared memory\n");
 +        goto ret_agg_dialogs;
 +      }
 +    }
 +    memcpy(pd->body.s, body->s, body->len);
 +    pd->body.len = body->len;
-+    if ( pu->pd != pd || pd->next!= NULL) {
++    if (pu->pd != pd || pd->next != NULL) {
 +      lock_release(&dbk_phtable[hash_code].lock);
 +      goto ret_current_dialog;
 +    }
-+    lock_release(&dbk_phtable[hash_code].lock);
 +  } else {
-+    LM_INFO("pd_prev: %p  pd->next: %p\n", pd_prev, pd->next);
 +    if (pd_prev == NULL && pd->next == NULL) { // there is no other dialog record
 +      LM_INFO("Found record %.*s/%.*s and matching dialog %.*s, no remaining dialogs removing pu record\n"
 +              ,local_user->len, local_user->s
@@ -843,7 +802,6 @@ index 0000000..56f242f
 +      }
 +      lock_release(&dbk_phtable[hash_code].lock);
 +      dbk_free_pu(pu);
-+      
 +      body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +                                                 initiator, localtag, remotetag, 0 , 0, 0);
 +      goto ret_current_dialog;
@@ -858,13 +816,13 @@ index 0000000..56f242f
 +      } else {
 +        pu->pd = pd->next;
 +      }
-+      lock_release(&dbk_phtable[hash_code].lock);
 +      dbk_free_pd(pd);
 +      body = pua_dialoginfo_api.build_dialoginfo(state->s, local_user, remote_user, callid,
 +                                                 initiator, localtag, remotetag, 0 , 0, 0);
 +    }
 +  }
-+  
++  lock_release(&dbk_phtable[hash_code].lock);
++
 + ret_agg_dialogs:
 +  if (dlg_no > 1) {
 +    str* body_copy = body;
@@ -1093,6 +1051,12 @@ index 0000000..56f242f
 +      goto error;
 +    }
 +    
++    LM_INFO("Received update: %.*s/%.*s %.*s %.*s"
++            ,from_user.len, from_user.s
++            ,to_user.len, to_user.s
++            ,callid.len, callid.s
++            ,state.len, state.s);
++
 +    if (!strcmp(direction.s, "inbound")) {
 +      LM_DBG("channel is the initiator\n");
 +      ret = dbk_pres_update_and_notify(&from_user, &to_user, &callid, &fromtag, &totag, &state, 1);
@@ -1100,12 +1064,6 @@ index 0000000..56f242f
 +      LM_DBG("channel is the recipient\n");
 +      ret = dbk_pres_update_and_notify(&to_user, &from_user, &callid, &totag, &fromtag, &state, 0);
 +    }
-+    
-+    LM_INFO("Received update: %.*s/%.*s %.*s %.*s"
-+            ,from_user.len, from_user.s
-+            ,to_user.len, to_user.s
-+            ,callid.len, callid.s
-+            ,state.len, state.s);
 +    
 +    if (ret < 0) {
 +      LM_ERR("Failed to process dialoginfo update command\n");
@@ -1912,7 +1870,7 @@ index 0000000..8b2d3a5
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..e2bd247
+index 0000000..b30ac3b
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
 @@ -0,0 +1,943 @@
@@ -2632,7 +2590,7 @@ index 0000000..e2bd247
 +        LM_DBG("Null socket -> can not get the network IP and port\n");
 +      }
 +    } else if (!received.len && strncmp(_k[col]->s, "received", 8) == 0) {
-+        if (use_contact_for_reg_notice == 0) {
++        if (use_contact_for_reg_notice) {
 +          LM_DBG("use_contact_for_reg_notice - construct from contact\n");
 +        } else if (!_v[col].nul) {
 +          received = _v[col].val.str_val;
