@@ -1,14 +1,14 @@
-From fa06ca34f9bda6e355411586c92ad857329b0404 Mon Sep 17 00:00:00 2001
+From a25fd891ae6004e49bfec88bc60ef22a76cb6364 Mon Sep 17 00:00:00 2001
 From: karl anderson <karl@2600hz.com>
 Date: Thu, 24 Oct 2013 18:50:24 -0400
-Subject: [PATCH] do not use contact by default, and fix race-condition resulting in duplicate hash entries
+Subject: [PATCH] do not use contact by default, and fix race-condition resulting in duplicate hash entries and fix consumer leak
 
 ---
  modules/db_kazoo/Makefile                          |   32 +
  modules/db_kazoo/blf.c                             | 1532 ++++++++++++++++++++
  modules/db_kazoo/blf.h                             |   25 +
  modules/db_kazoo/db_kazoo.c                        |  208 +++
- modules/db_kazoo/dbase.c                           |  943 ++++++++++++
+ modules/db_kazoo/dbase.c                           |  939 ++++++++++++
  modules/db_kazoo/dbase.h                           |  101 ++
  modules/dispatcher/dispatch.c                      |    8 +-
  modules/dispatcher/dispatch.h                      |    1 +
@@ -37,7 +37,7 @@ Subject: [PATCH] do not use contact by default, and fix race-condition resulting
  modules/rls/subscribe.c                            |    7 +-
  modules/usrloc/dlist.c                             |    3 +-
  modules/usrloc/ul_mod.c                            |    5 +-
- 33 files changed, 3294 insertions(+), 70 deletions(-)
+ 33 files changed, 3290 insertions(+), 70 deletions(-)
  create mode 100644 modules/db_kazoo/Makefile
  create mode 100644 modules/db_kazoo/blf.c
  create mode 100644 modules/db_kazoo/blf.h
@@ -1870,10 +1870,10 @@ index 0000000..8b2d3a5
 +
 diff --git a/modules/db_kazoo/dbase.c b/modules/db_kazoo/dbase.c
 new file mode 100644
-index 0000000..b30ac3b
+index 0000000..284e0bf
 --- /dev/null
 +++ b/modules/db_kazoo/dbase.c
-@@ -0,0 +1,943 @@
+@@ -0,0 +1,939 @@
 +
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -2227,6 +2227,7 @@ index 0000000..b30ac3b
 +  amqp_bytes_t amqp_rk;
 +  amqp_bytes_t amqp_mb;
 +  amqp_bytes_t rpl_queue= {0, 0};
++  amqp_bytes_t consumer_tag= {0, 0};
 +  str unique_string = {0, 0};
 +  int ret = -1;
 +
@@ -2236,7 +2237,7 @@ index 0000000..b30ac3b
 +  }
 +
 +  LM_DBG("Query creds: %d rmq(%p)->conn(%p) %d\n", getpid(), (void *)rmq, rmq->conn, rmq->channel);
-+  
++
 +  /* routingkey = authn.req._auth_realm_ */
 +  amqp_rk.bytes = routingkey;
 +  memcpy(routingkey, AUTH_ROUTING_KEY_PREFIX, AUTH_ROUTING_KEY_PREFIX_LEN);
@@ -2304,13 +2305,14 @@ index 0000000..b30ac3b
 +    ret = -RET_AMQP_ERROR;
 +    goto error;
 +  }
-+  
-+  if ( amqp_basic_consume(rmq->conn, rmq->channel, rpl_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table) < 0 ||
-+       rmq_error("Consuming", amqp_get_rpc_reply(rmq->conn))) {
++
++  amqp_basic_consume_ok_t *consume_ok = amqp_basic_consume(rmq->conn, rmq->channel, rpl_queue, amqp_empty_bytes, 0, 1, 1, amqp_empty_table);
++  if (rmq_error("Consuming", amqp_get_rpc_reply(rmq->conn))) {
 +    ret = -RET_AMQP_ERROR;
-+    goto error;
++    goto error;      
 +  }
-+  
++  consumer_tag = amqp_bytes_malloc_dup(consume_ok->consumer_tag);
++
 +  LM_DBG("AMQP: after queue_bind  rpl_routing_key: [%.*s]\n", (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes);
 +  LM_DBG("AMQP: after queue_bind  server_id: [%s]\n", serverid);
 +
@@ -2448,22 +2450,16 @@ index 0000000..b30ac3b
 +  ret = 0;
 +
 + error:
-+  if(rpl_queue.bytes) {
-+    /*
-+    amqp_queue_purge(rmq->conn, rmq->channel, rpl_queue);
-+    if (rmq_error("Purging reply queue", amqp_get_rpc_reply(rmq->conn))) {
-+      LM_ERR("Failed to purge reply queue\n");
-+    }    
-+    LM_DBG("rpl_queue [%.*s], rpl_exchange [%.*s], rpl_routing_key [%.*s]\n",
-+           (int)rpl_queue.len, (char*)rpl_queue.bytes, 
-+           (int)rpl_exch.len, (char*)rpl_exch.bytes, 
-+           (int)rpl_routing_key.len, (char*)rpl_routing_key.bytes 
-+           );
-+    amqp_queue_unbind(rmq->conn, rmq->channel, rpl_queue, rpl_exch,  rpl_routing_key, amqp_empty_table);	
-+    if (rmq_error("Unbinding reply queue", amqp_get_rpc_reply(rmq->conn))) {
-+      LM_ERR("Failed to unbind queue\n");
++  if(consumer_tag.bytes) {
++    amqp_basic_cancel(rmq->conn, rmq->channel, consumer_tag);
++    if (rmq_error("Canceling consumer", amqp_get_rpc_reply(rmq->conn))) {
++      LM_ERR("Failed to cancel consumer\n");
 +    }
-+    */
++    LM_DBG("consumer_tag [%.*s]\n", (int)consumer_tag.len, (char*)consumer_tag.bytes);
++    
++    amqp_bytes_free(consumer_tag);
++  }
++  if(rpl_queue.bytes) {
 +    amqp_queue_delete(rmq->conn, rmq->channel, rpl_queue, 0, 0);
 +    if (rmq_error("Deleting reply queue", amqp_get_rpc_reply(rmq->conn))) {
 +      LM_ERR("Failed to delete queue\n");
